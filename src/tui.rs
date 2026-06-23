@@ -25,6 +25,7 @@ const REGISTER_VALUE_WIDTH: u16 = 18;
 const REGISTER_TABLE_DECORATION_WIDTH: u16 = 6;
 const REGISTER_PANE_WIDTH: u16 =
     REGISTER_NAME_WIDTH + REGISTER_VALUE_WIDTH + REGISTER_TABLE_DECORATION_WIDTH;
+const INSTRUCTION_CLASS_WIDTH: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchInfo {
@@ -34,6 +35,39 @@ struct BranchInfo {
     target: u64,
     taken: bool,
     operator: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JumpInfo {
+    mnemonic: &'static str,
+    rd: usize,
+    rs1: usize,
+    target: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemInfo {
+    mnemonic: &'static str,
+    register: usize,
+    rs1: usize,
+    offset: i64,
+    address: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AluInfo {
+    mnemonic: &'static str,
+    rd: usize,
+    rs1: usize,
+    rhs: AluRhs,
+    result: u64,
+    operator: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AluRhs {
+    Register(usize),
+    Immediate(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,13 +296,7 @@ fn execute_command(input: &str, debugger: &mut Debugger, app: &mut App) {
 fn submit_command(debugger: &mut Debugger, app: &mut App) {
     let typed = std::mem::take(&mut app.command);
     let input = if typed.trim().is_empty() {
-        match app.last_command.clone() {
-            Some(command) => command,
-            None => {
-                app.status = "no previous command".into();
-                return;
-            }
-        }
+        app.last_command.clone().unwrap_or_else(|| "step".into())
     } else {
         typed
     };
@@ -374,11 +402,113 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                     ));
                     spans.push(Span::styled("  ", base));
                     spans.push(Span::styled(
-                        instruction_name(instruction),
+                        format!(
+                            "{:<width$}",
+                            instruction_name(instruction),
+                            width = INSTRUCTION_CLASS_WIDTH
+                        ),
                         base.patch(Style::default().fg(Color::Green)),
                     ));
                     if let Some(branch) = branch_info(instruction, address, debugger) {
                         spans.extend(branch_spans(&branch, base, debugger));
+                    } else {
+                        // Decode jumps
+                        if let Some(jump) = decode_jump(instruction, address, debugger) {
+                            let rd_name = if jump.rd == 0 {
+                                "zero"
+                            } else {
+                                REGISTER_NAMES[jump.rd]
+                            };
+                            spans.extend([
+                                Span::styled(
+                                    if jump.mnemonic == "jal" {
+                                        format!("{} {},", jump.mnemonic, rd_name)
+                                    } else {
+                                        format!(
+                                            "{} {},{}({}) -> ",
+                                            jump.mnemonic,
+                                            rd_name,
+                                            i_immediate(instruction),
+                                            REGISTER_NAMES[jump.rs1]
+                                        )
+                                    },
+                                    base,
+                                ),
+                                Span::styled(
+                                    format!("{:#018x}", jump.target),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
+                        }
+                        // Decode memory ops
+                        else if let Some(mem) = decode_mem(instruction, debugger) {
+                            let register_name = if mem.register == 0 {
+                                "zero"
+                            } else {
+                                REGISTER_NAMES[mem.register]
+                            };
+                            let base_val = debugger.machine.cpu.register(mem.rs1);
+                            spans.extend([
+                                Span::styled(
+                                    format!(
+                                        "{} {},{}({}) [",
+                                        mem.mnemonic,
+                                        register_name,
+                                        mem.offset,
+                                        REGISTER_NAMES[mem.rs1]
+                                    ),
+                                    base,
+                                ),
+                                Span::styled(
+                                    format!("{base_val:#x}"),
+                                    base.patch(Style::default().fg(Color::Yellow)),
+                                ),
+                                Span::styled(format!(" + {}] @ ", mem.offset), base),
+                                Span::styled(
+                                    format!("{:#018x}", mem.address),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
+                        }
+                        // Decode ALU ops
+                        else if let Some(alu) = decode_alu(instruction, debugger) {
+                            let rd_name = if alu.rd == 0 {
+                                "zero"
+                            } else {
+                                REGISTER_NAMES[alu.rd]
+                            };
+                            let lhs = debugger.machine.cpu.register(alu.rs1);
+                            let (rhs_name, rhs_value) = match alu.rhs {
+                                AluRhs::Register(rs2) => {
+                                    let val = debugger.machine.cpu.register(rs2);
+                                    (REGISTER_NAMES[rs2].to_string(), val)
+                                }
+                                AluRhs::Immediate(imm) => (imm.to_string(), imm as u64),
+                            };
+                            spans.extend([
+                                Span::styled(
+                                    format!(
+                                        "{} {},{},{} [",
+                                        alu.mnemonic, rd_name, REGISTER_NAMES[alu.rs1], rhs_name
+                                    ),
+                                    base,
+                                ),
+                                Span::styled(
+                                    format!("{lhs:#x}"),
+                                    base.patch(Style::default().fg(Color::Yellow)),
+                                ),
+                                Span::styled(format!(" {} ", alu.operator), base),
+                                Span::styled(
+                                    format!("{rhs_value:#x}"),
+                                    base.patch(Style::default().fg(Color::Yellow)),
+                                ),
+                                Span::styled("] -> ", base),
+                                Span::styled(
+                                    format!("{:#018x}", alu.result),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
+                        }
                     }
                 }
                 Err(_) => spans.push(Span::styled(
@@ -610,7 +740,7 @@ fn branch_spans<'a>(branch: &BranchInfo, base: Style, debugger: &Debugger) -> Ve
     vec![
         Span::styled(
             format!(
-                " {} {},{} [",
+                "{} {},{} [",
                 branch.mnemonic, REGISTER_NAMES[branch.rs1], REGISTER_NAMES[branch.rs2]
             ),
             base,
@@ -655,9 +785,194 @@ fn branch_arrow(address: u64, source: u64, target: u64, first: u64, last: u64) -
     "    "
 }
 
+// Jump decoding helpers
+fn jal_immediate(instruction: u32) -> i64 {
+    let value = ((instruction >> 31) << 20)
+        | (((instruction >> 12) & 0xff) << 12)
+        | (((instruction >> 20) & 1) << 11)
+        | (((instruction >> 21) & 0x3ff) << 1);
+    ((value << 11) as i32 >> 11) as i64
+}
+
+fn i_immediate(instruction: u32) -> i64 {
+    let imm = (instruction >> 20) & 0xfff;
+    ((imm << 20) as i32 >> 20) as i64
+}
+
+fn s_immediate(instruction: u32) -> i64 {
+    let immediate = ((instruction >> 25) << 5) | ((instruction >> 7) & 0x1f);
+    ((immediate << 20) as i32 >> 20) as i64
+}
+
+fn decode_jump(instruction: u32, address: u64, debugger: &Debugger) -> Option<JumpInfo> {
+    let opcode = instruction & 0x7f;
+    let rd = ((instruction >> 7) & 0x1f) as usize;
+    if opcode == 0x6f {
+        let target = address.wrapping_add(jal_immediate(instruction) as u64);
+        Some(JumpInfo {
+            mnemonic: "jal",
+            rd,
+            rs1: 0,
+            target,
+        })
+    } else if opcode == 0x67 && ((instruction >> 12) & 0x7) == 0 {
+        let rs1 = ((instruction >> 15) & 0x1f) as usize;
+        let imm = i_immediate(instruction);
+        let base = debugger.machine.cpu.register(rs1);
+        let target = base.wrapping_add(imm as u64) & !1;
+        Some(JumpInfo {
+            mnemonic: "jalr",
+            rd,
+            rs1,
+            target,
+        })
+    } else {
+        None
+    }
+}
+
+fn decode_mem(instruction: u32, debugger: &Debugger) -> Option<MemInfo> {
+    let opcode = instruction & 0x7f;
+    let funct3 = (instruction >> 12) & 0x7;
+    if opcode != 0x03 && opcode != 0x23 {
+        return None;
+    }
+    let rs1 = ((instruction >> 15) & 0x1f) as usize;
+    let base = debugger.machine.cpu.register(rs1);
+    let (register, offset) = if opcode == 0x03 {
+        (
+            ((instruction >> 7) & 0x1f) as usize,
+            i_immediate(instruction),
+        )
+    } else {
+        (
+            ((instruction >> 20) & 0x1f) as usize,
+            s_immediate(instruction),
+        )
+    };
+    let addr = base.wrapping_add(offset as u64);
+    let mnemonic = match (opcode, funct3) {
+        (0x03, 0) => "lb",
+        (0x03, 1) => "lh",
+        (0x03, 2) => "lw",
+        (0x03, 3) => "ld",
+        (0x03, 4) => "lbu",
+        (0x03, 5) => "lhu",
+        (0x03, 6) => "lwu",
+        (0x23, 0) => "sb",
+        (0x23, 1) => "sh",
+        (0x23, 2) => "sw",
+        (0x23, 3) => "sd",
+        _ => return None,
+    };
+    Some(MemInfo {
+        mnemonic,
+        register,
+        rs1,
+        offset,
+        address: addr,
+    })
+}
+
+fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
+    let opcode = instruction & 0x7f;
+    let rd = ((instruction >> 7) & 0x1f) as usize;
+    let rs1 = ((instruction >> 15) & 0x1f) as usize;
+    let funct3 = (instruction >> 12) & 0x7;
+    let lhs = debugger.machine.cpu.register(rs1);
+
+    let (mnemonic, rhs, result, operator) = if opcode == 0x13 {
+        let imm = i_immediate(instruction);
+        let shift = u64::from((instruction >> 20) & 0x3f);
+        match funct3 {
+            0 => (
+                "addi",
+                AluRhs::Immediate(imm),
+                lhs.wrapping_add(imm as u64),
+                "+",
+            ),
+            1 if instruction >> 26 == 0 => {
+                ("slli", AluRhs::Immediate(shift as i64), lhs << shift, "<<")
+            }
+            2 => (
+                "slti",
+                AluRhs::Immediate(imm),
+                ((lhs as i64) < imm) as u64,
+                "<s",
+            ),
+            3 => (
+                "sltiu",
+                AluRhs::Immediate(imm),
+                (lhs < imm as u64) as u64,
+                "<u",
+            ),
+            4 => ("xori", AluRhs::Immediate(imm), lhs ^ imm as u64, "^"),
+            5 if instruction >> 26 == 0 => {
+                ("srli", AluRhs::Immediate(shift as i64), lhs >> shift, ">>")
+            }
+            5 if instruction >> 26 == 0x10 => (
+                "srai",
+                AluRhs::Immediate(shift as i64),
+                ((lhs as i64) >> shift) as u64,
+                ">>s",
+            ),
+            6 => ("ori", AluRhs::Immediate(imm), lhs | imm as u64, "|"),
+            7 => ("andi", AluRhs::Immediate(imm), lhs & imm as u64, "&"),
+            _ => return None,
+        }
+    } else if opcode == 0x33 {
+        let rs2 = ((instruction >> 20) & 0x1f) as usize;
+        let rhs_val = debugger.machine.cpu.register(rs2);
+        let funct7 = (instruction >> 25) & 0x7f;
+        let shift = rhs_val & 0x3f;
+        let (mnemonic, result, operator) = match (funct3, funct7) {
+            (0, 0) => ("add", lhs.wrapping_add(rhs_val), "+"),
+            (0, 0x20) => ("sub", lhs.wrapping_sub(rhs_val), "-"),
+            (1, 0) => ("sll", lhs << shift, "<<"),
+            (2, 0) => ("slt", ((lhs as i64) < (rhs_val as i64)) as u64, "<s"),
+            (3, 0) => ("sltu", (lhs < rhs_val) as u64, "<u"),
+            (4, 0) => ("xor", lhs ^ rhs_val, "^"),
+            (5, 0) => ("srl", lhs >> shift, ">>"),
+            (5, 0x20) => ("sra", ((lhs as i64) >> shift) as u64, ">>s"),
+            (6, 0) => ("or", lhs | rhs_val, "|"),
+            (7, 0) => ("and", lhs & rhs_val, "&"),
+            _ => return None,
+        };
+        (mnemonic, AluRhs::Register(rs2), result, operator)
+    } else {
+        return None;
+    };
+
+    Some(AluInfo {
+        mnemonic,
+        rd,
+        rs1,
+        rhs,
+        result,
+        operator,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn i_type(immediate: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+        (immediate << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    }
+
+    fn r_type(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x33
+    }
+
+    fn s_type(immediate: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+        ((immediate >> 5) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((immediate & 0x1f) << 7)
+            | 0x23
+    }
 
     fn debugger() -> Debugger {
         Debugger::new(&0x0010_0073_u32.to_le_bytes(), Machine::LOAD_ADDRESS, 4096).unwrap()
@@ -714,12 +1029,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_enter_without_history_is_a_noop() {
-        let mut debugger = debugger();
+    fn empty_enter_without_history_steps() {
+        let image: Vec<u8> = [0x0010_8093_u32, 0x0010_0073]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut debugger =
+            Debugger::new(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
         let mut app = App::new();
         submit_command(&mut debugger, &mut app);
-        assert_eq!(app.status, "no previous command");
-        assert_eq!(debugger.machine.cpu.pc, Machine::LOAD_ADDRESS);
+        assert_eq!(debugger.machine.cpu.pc, Machine::LOAD_ADDRESS + 4);
+        assert_eq!(debugger.machine.cpu.register(1), 1);
+        assert_eq!(app.last_command.as_deref(), Some("step"));
     }
 
     #[test]
@@ -763,5 +1084,47 @@ mod tests {
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 12)), 10);
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 40)), 38);
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 1)), 1);
+    }
+
+    #[test]
+    fn store_decoder_uses_rs2_and_s_immediate() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(2, 0x8000_1000);
+        let instruction = s_type(0xff8, 10, 2, 3); // sd a0, -8(sp)
+        let decoded = decode_mem(instruction, &debugger).unwrap();
+        assert_eq!(decoded.mnemonic, "sd");
+        assert_eq!(decoded.register, 10);
+        assert_eq!(decoded.offset, -8);
+        assert_eq!(decoded.address, 0x8000_0ff8);
+    }
+
+    #[test]
+    fn alu_decoder_distinguishes_similar_funct3_encodings() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(1, 0x8000_0000_0000_0000);
+        debugger.machine.cpu.set_register(2, 65);
+
+        let ori = decode_alu(i_type(7, 1, 6, 3, 0x13), &debugger).unwrap();
+        assert_eq!(ori.mnemonic, "ori");
+
+        let srai = decode_alu(i_type(0x401, 1, 5, 3, 0x13), &debugger).unwrap();
+        assert_eq!(srai.mnemonic, "srai");
+        assert_eq!(srai.result, 0xc000_0000_0000_0000);
+
+        let sub = decode_alu(r_type(0x20, 2, 1, 0, 3), &debugger).unwrap();
+        assert_eq!(sub.mnemonic, "sub");
+
+        let sra = decode_alu(r_type(0x20, 2, 1, 5, 3), &debugger).unwrap();
+        assert_eq!(sra.mnemonic, "sra");
+        assert_eq!(sra.result, 0xc000_0000_0000_0000);
+    }
+
+    #[test]
+    fn decoded_instruction_column_has_fixed_width() {
+        assert_eq!(format!("{:<INSTRUCTION_CLASS_WIDTH$}", "op"), "op        ");
+        assert_eq!(
+            format!("{:<INSTRUCTION_CLASS_WIDTH$}", "op-imm-32").len(),
+            10
+        );
     }
 }

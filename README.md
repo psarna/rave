@@ -31,7 +31,8 @@ and F11 provide continue, next, and step shortcuts. Register edits update the
 display as they are typed; use `u`, `undo`, or Ctrl-Z to restore the previous
 value. Press `q` to quit. Ctrl-C and Ctrl-D require two presses within one
 second, reducing accidental exits. Press Enter on an empty command prompt to
-repeat the previous command, as in GDB.
+repeat the previous command, as in GDB. Before any command has been entered,
+Enter defaults to `step`.
 
 Conditional branches show their operands, evaluated condition, taken/not-taken
 state, and target address. When the current branch target is visible in the
