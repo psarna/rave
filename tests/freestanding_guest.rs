@@ -4,12 +4,43 @@ use std::process::Command;
 
 #[test]
 fn compiles_and_runs_a_freestanding_rv64i_guest() {
+    let result = compile_and_run_guest("guest", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"O");
+}
+
+#[test]
+fn compiles_and_runs_a_uart_guest() {
+    let result = compile_and_run_guest("uart", b"Ada\n", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"name?\noh hai Ada!\n");
+}
+
+struct GuestResult {
+    reason: HaltReason,
+    uart_output: Vec<u8>,
+}
+
+fn compile_and_run_guest(name: &str, uart_input: &[u8], instruction_limit: u64) -> GuestResult {
+    let binary = compile_guest(name);
+    let image = std::fs::read(binary).unwrap();
+    let mut machine =
+        Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
+    machine.bus.push_uart_input(uart_input);
+    let reason = machine.run(instruction_limit).unwrap();
+    GuestResult {
+        reason,
+        uart_output: machine.bus.uart_output().to_vec(),
+    }
+}
+
+fn compile_guest(name: &str) -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out = std::env::temp_dir().join(format!("rave-guest-{}", std::process::id()));
+    let out = std::env::temp_dir().join(format!("rave-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
-    let object = out.join("guest.o");
-    let elf = out.join("guest.elf");
-    let binary = out.join("guest.bin");
+    let object = out.join(format!("{name}.o"));
+    let elf = out.join(format!("{name}.elf"));
+    let binary = out.join(format!("{name}.bin"));
 
     run(
         Command::new("clang")
@@ -24,7 +55,7 @@ fn compiles_and_runs_a_freestanding_rv64i_guest() {
                 "-O1",
                 "-c",
             ])
-            .arg(root.join("tests/fixtures/guest.c"))
+            .arg(root.join(format!("tests/fixtures/{name}.c")))
             .arg("-o")
             .arg(&object),
         "compile RV64I guest",
@@ -49,13 +80,7 @@ fn compiles_and_runs_a_freestanding_rv64i_guest() {
         "convert guest to raw binary",
     );
 
-    let image = std::fs::read(binary).unwrap();
-    let mut machine =
-        Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
-    assert_eq!(
-        machine.run(100_000).unwrap(),
-        HaltReason::Breakpoint { code: 0 }
-    );
+    binary
 }
 
 fn run(command: &mut Command, description: &str) {

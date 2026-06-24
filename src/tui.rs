@@ -14,7 +14,7 @@ use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
 const HELP: &str =
-    "start | step(s) | next(n) | break(b) ADDR | continue(c) | set REG VALUE | undo(u) | quit(q)";
+    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const PC_INDEX: usize = 32;
 const INSTRUCTION_SIZE: u64 = 4;
@@ -87,6 +87,7 @@ enum Mode {
     Command,
     RegisterSelect,
     RegisterEdit,
+    UartInput,
 }
 
 struct App {
@@ -94,6 +95,7 @@ struct App {
     command: String,
     last_command: Option<String>,
     edit_value: String,
+    uart_input: String,
     selected_register: usize,
     status: String,
     quit: bool,
@@ -108,6 +110,7 @@ impl App {
             command: String::new(),
             last_command: None,
             edit_value: String::new(),
+            uart_input: String::new(),
             selected_register: 0,
             status: "loaded; use start, step, or continue".into(),
             quit: false,
@@ -174,6 +177,7 @@ fn handle_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         Mode::Command => handle_command_key(key, debugger, app),
         Mode::RegisterSelect => handle_register_key(key, debugger, app),
         Mode::RegisterEdit => handle_edit_key(key, debugger, app),
+        Mode::UartInput => handle_uart_input_key(key, debugger, app),
     }
 }
 
@@ -190,6 +194,7 @@ fn handle_command_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         KeyCode::F(5) => execute_command("continue", debugger, app),
         KeyCode::F(10) => execute_command("next", debugger, app),
         KeyCode::F(11) => execute_command("step", debugger, app),
+        KeyCode::F(6) => enter_uart_input(app),
         KeyCode::Char('q') if app.command.is_empty() => app.quit = true,
         KeyCode::Char(character)
             if !key
@@ -223,6 +228,7 @@ fn handle_register_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         KeyCode::Char('n') | KeyCode::F(10) => execute_command("next", debugger, app),
         KeyCode::Char('c') | KeyCode::F(5) => execute_command("continue", debugger, app),
         KeyCode::Char('u') => undo_last_edit(debugger, app),
+        KeyCode::Char('i') | KeyCode::F(6) => enter_uart_input(app),
         _ => {}
     }
 }
@@ -250,6 +256,54 @@ fn handle_edit_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
             app.edit_value.push(character)
         }
         _ => {}
+    }
+}
+
+fn handle_uart_input_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
+    match key.code {
+        KeyCode::Esc => {
+            app.uart_input.clear();
+            app.mode = Mode::Command;
+        }
+        KeyCode::Backspace => {
+            app.uart_input.pop();
+        }
+        KeyCode::Enter => submit_uart_input(debugger, app),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.uart_input.push(character)
+        }
+        _ => {}
+    }
+}
+
+fn enter_uart_input(app: &mut App) {
+    app.uart_input.clear();
+    app.mode = Mode::UartInput;
+    app.status = "type UART input and press Enter to send newline".into();
+}
+
+fn submit_uart_input(debugger: &mut Debugger, app: &mut App) {
+    let input = std::mem::take(&mut app.uart_input);
+    let byte_count = input.len() + 1;
+    match debugger.execute(Command::UartInput(input), Machine::INSTRUCTION_LIMIT) {
+        Ok(_) => {
+            app.mode = Mode::Command;
+            match debugger.continue_execution(Machine::INSTRUCTION_LIMIT) {
+                Ok(reason) => {
+                    app.status =
+                        format!("queued {byte_count} UART byte(s); {}", format_stop(reason));
+                    if reason == StopReason::UartInput {
+                        enter_uart_input(app);
+                    }
+                }
+                Err(error) => app.status = error.to_string(),
+            }
+        }
+        Err(error) => app.status = error.to_string(),
     }
 }
 
@@ -284,10 +338,16 @@ fn execute_command(input: &str, debugger: &mut Debugger, app: &mut App) {
         Command::SetRegister { index, value } => {
             Some(format!("{} = {value:#018x}", register_label(*index)))
         }
+        Command::UartInput(input) => Some(format!("queued {} UART byte(s)", input.len() + 1)),
         _ => None,
     };
     match debugger.execute(command, Machine::INSTRUCTION_LIMIT) {
-        Ok(Some(reason)) => app.status = format_stop(reason),
+        Ok(Some(reason)) => {
+            app.status = format_stop(reason);
+            if reason == StopReason::UartInput {
+                enter_uart_input(app);
+            }
+        }
         Ok(None) => app.status = description.unwrap_or_else(|| "ok".into()),
         Err(error) => app.status = error.to_string(),
     }
@@ -312,6 +372,7 @@ fn format_stop(reason: StopReason) -> String {
         StopReason::Started => "program reset at entry point".into(),
         StopReason::Stepped => "executed one instruction".into(),
         StopReason::Breakpoint(address) => format!("breakpoint hit at {address:#018x}"),
+        StopReason::UartInput => "guest is waiting for UART input".into(),
         StopReason::Halted(reason) => format!("guest halted: {reason:?}"),
     }
 }
@@ -320,7 +381,8 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(12),
+            Constraint::Min(10),
+            Constraint::Length(5),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
@@ -331,13 +393,14 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         .split(outer[0]);
     draw_code(frame, body[0], debugger);
     draw_registers(frame, body[1], debugger, app);
+    draw_uart(frame, outer[1], debugger);
     frame.render_widget(
         Paragraph::new(app.status.as_str())
             .block(Block::default().title(" Status ").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
-        outer[1],
+        outer[2],
     );
-    draw_prompt(frame, outer[2], app);
+    draw_prompt(frame, outer[3], app);
 }
 
 fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
@@ -533,6 +596,51 @@ fn visible_code_rows(area: Rect) -> u64 {
     u64::from(area.height.saturating_sub(PANEL_BORDER_HEIGHT).max(1))
 }
 
+fn draw_uart(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
+    let output = debugger.machine.bus.uart_output();
+    let lines: Vec<Line<'_>> = uart_output_text_lines(output, visible_uart_rows(area))
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" UART output ({} bytes) ", output.len()))
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn visible_uart_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(PANEL_BORDER_HEIGHT).max(1))
+}
+
+fn uart_output_text_lines(output: &[u8], max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![String::new()];
+    for byte in output {
+        match *byte {
+            b'\n' => lines.push(String::new()),
+            b'\r' => {}
+            b'\t' => lines.last_mut().unwrap().push('\t'),
+            0x20..=0x7e => lines.last_mut().unwrap().push(char::from(*byte)),
+            _ => lines
+                .last_mut()
+                .unwrap()
+                .push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].to_vec()
+}
+
 fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
     let rows = (0..=PC_INDEX).map(|index| {
         let live_edit = app.mode == Mode::RegisterEdit && index == app.selected_register;
@@ -557,7 +665,7 @@ fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &
     let title = match app.mode {
         Mode::RegisterSelect => " Registers [Tab: prompt, Enter: edit] ",
         Mode::RegisterEdit => " Registers [live edit; Enter commit, Esc cancel] ",
-        Mode::Command => " Registers [Tab: select] ",
+        Mode::Command | Mode::UartInput => " Registers [Tab: select] ",
     };
     let table = Table::new(
         rows,
@@ -588,6 +696,10 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "↑/↓ select, Enter edit, u undo, r/s/n/c execute, q quit",
         ),
         Mode::RegisterEdit => (" New register value ", app.edit_value.as_str()),
+        Mode::UartInput => (
+            " UART input [Enter sends newline, Esc cancels] ",
+            app.uart_input.as_str(),
+        ),
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1084,6 +1196,49 @@ mod tests {
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 12)), 10);
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 40)), 38);
         assert_eq!(visible_code_rows(Rect::new(0, 0, 80, 1)), 1);
+    }
+
+    #[test]
+    fn uart_input_mode_queues_line_and_resumes_execution() {
+        let image: Vec<u8> = [
+            0x0050_c283_u32,
+            0x0012_f293,
+            0xfe02_8ce3,
+            0x0000_c503,
+            0x0010_0073,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        let mut debugger = Debugger::new(&image, Machine::LOAD_ADDRESS, 4096).unwrap();
+        debugger.machine.cpu.set_register(1, 0x1000_0000);
+        let mut app = App::new();
+
+        execute_command("continue", &mut debugger, &mut app);
+        assert_eq!(app.mode, Mode::UartInput);
+
+        app.uart_input = "A".into();
+        submit_uart_input(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.register(10), u64::from(b'A'));
+        assert!(app.status.contains("guest halted"));
+    }
+
+    #[test]
+    fn uart_view_uses_rows_inside_its_border() {
+        assert_eq!(visible_uart_rows(Rect::new(0, 0, 80, 5)), 3);
+        assert_eq!(visible_uart_rows(Rect::new(0, 0, 80, 1)), 1);
+    }
+
+    #[test]
+    fn uart_output_view_tails_and_escapes_bytes() {
+        assert_eq!(
+            uart_output_text_lines(b"one\ntwo\nthree", 2),
+            vec!["two".to_string(), "three".to_string()]
+        );
+        assert_eq!(
+            uart_output_text_lines(b"A\x00\xffZ", 1),
+            vec!["A\\x00\\xffZ".to_string()]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub enum Command {
     Next,
     Break(u64),
     Continue,
+    UartInput(String),
     SetRegister { index: usize, value: u64 },
     Undo,
     Help,
@@ -37,6 +38,16 @@ impl FromStr for Command {
     type Err = CommandError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let trimmed = input.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("uart ")
+            .or_else(|| trimmed.strip_prefix("input "))
+        {
+            return Ok(Self::UartInput(rest.to_string()));
+        }
+        if trimmed == "uart" || trimmed == "input" {
+            return Err(CommandError("missing UART input".into()));
+        }
         let mut words = input.split_whitespace();
         let name = words
             .next()
@@ -48,7 +59,7 @@ impl FromStr for Command {
             "continue" | "cont" | "c" => no_args(words, Self::Continue),
             "help" | "h" | "?" => no_args(words, Self::Help),
             "undo" | "u" => no_args(words, Self::Undo),
-            "quit" | "q" => no_args(words, Self::Quit),
+            "exit" | "quit" | "q" => no_args(words, Self::Quit),
             "break" | "b" => {
                 let address = parse_number(required(&mut words, "address")?)?;
                 no_args(words, Self::Break(address))
@@ -123,6 +134,7 @@ pub enum StopReason {
     Started,
     Stepped,
     Breakpoint(u64),
+    UartInput,
     Halted(HaltReason),
 }
 
@@ -133,6 +145,7 @@ pub struct Debugger {
     memory_size: usize,
     breakpoints: BTreeSet<u64>,
     skip_current_breakpoint: bool,
+    uart_wait_output_len: Option<usize>,
 }
 
 impl Debugger {
@@ -144,6 +157,7 @@ impl Debugger {
             memory_size,
             breakpoints: BTreeSet::new(),
             skip_current_breakpoint: false,
+            uart_wait_output_len: None,
         })
     }
 
@@ -154,6 +168,7 @@ impl Debugger {
     pub fn start(&mut self) -> Result<StopReason, MachineError> {
         self.machine = Machine::from_raw(&self.image, self.load_address, self.memory_size)?;
         self.skip_current_breakpoint = false;
+        self.uart_wait_output_len = None;
         Ok(StopReason::Started)
     }
 
@@ -161,6 +176,7 @@ impl Debugger {
         self.skip_current_breakpoint = false;
         match self.machine.step()? {
             Some(reason) => Ok(StopReason::Halted(reason)),
+            None if self.should_stop_for_uart_input() => Ok(StopReason::UartInput),
             None => Ok(StopReason::Stepped),
         }
     }
@@ -179,8 +195,26 @@ impl Debugger {
             if let Some(reason) = self.machine.step()? {
                 return Ok(StopReason::Halted(reason));
             }
+            if self.should_stop_for_uart_input() {
+                return Ok(StopReason::UartInput);
+            }
         }
         Err(MachineError::InstructionLimit(instruction_limit))
+    }
+
+    fn should_stop_for_uart_input(&mut self) -> bool {
+        if !self.machine.bus.take_uart_input_wait() {
+            return false;
+        }
+
+        let output_len = self.machine.bus.uart_output().len();
+        if self.uart_wait_output_len == Some(output_len) {
+            self.uart_wait_output_len = None;
+            true
+        } else {
+            self.uart_wait_output_len = Some(output_len);
+            false
+        }
     }
 
     pub fn execute(
@@ -196,6 +230,13 @@ impl Debugger {
                 Ok(None)
             }
             Command::Continue => self.continue_execution(instruction_limit).map(Some),
+            Command::UartInput(input) => {
+                let mut bytes = input.into_bytes();
+                bytes.push(b'\n');
+                self.machine.bus.push_uart_input(&bytes);
+                self.uart_wait_output_len = None;
+                Ok(None)
+            }
             Command::SetRegister { index, value } => {
                 self.machine.cpu.set_register(index, value);
                 Ok(None)
@@ -231,6 +272,10 @@ mod tests {
         );
         assert_eq!("next".parse(), Ok(Command::Next));
         assert_eq!("undo".parse(), Ok(Command::Undo));
+        assert_eq!(
+            "uart Ada Lovelace".parse(),
+            Ok(Command::UartInput("Ada Lovelace".into()))
+        );
     }
 
     #[test]
@@ -247,6 +292,20 @@ mod tests {
             StopReason::Halted(HaltReason::Breakpoint { code: 0 })
         );
         assert_eq!(debugger.machine.cpu.register(1), 2);
+    }
+
+    #[test]
+    fn continue_stops_when_guest_waits_for_uart_input() {
+        let image: Vec<u8> = [0x0050_c103_u32, 0xfe00_0ee3]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut debugger = Debugger::new(&image, DRAM_START, 4096).unwrap();
+        debugger.machine.cpu.set_register(1, crate::bus::UART_START);
+        assert_eq!(
+            debugger.continue_execution(10).unwrap(),
+            StopReason::UartInput
+        );
     }
 
     #[test]

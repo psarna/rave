@@ -1,7 +1,11 @@
 mod tui;
 
 use rave::Machine;
-use std::{env, fs, process};
+use std::{
+    env, fs,
+    io::{self, IsTerminal, Read, Write},
+    process,
+};
 
 const USAGE: &str = "usage: rave [--interactive] <guest.bin>";
 
@@ -32,6 +36,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return tui::run(&image);
     }
     let mut machine = Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE)?;
-    println!("{:?}", machine.run(Machine::INSTRUCTION_LIMIT)?);
+    if !io::stdin().is_terminal() {
+        let mut input = Vec::new();
+        io::stdin().read_to_end(&mut input)?;
+        machine.bus.push_uart_input(&input);
+    }
+    let reason = machine.run(Machine::INSTRUCTION_LIMIT)?;
+    io::stdout().write_all(machine.bus.uart_output())?;
+    println!("{reason:?}");
     Ok(())
 }
