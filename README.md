@@ -1,6 +1,6 @@
 # rave
 
-![demo](demo/screen.png)
+![logo](demo/rave.png)
 
 A minimal RV64I (more letters coming!) emulator
 
@@ -21,6 +21,8 @@ When stdin is piped in non-interactive mode, the bytes are queued as UART
 receive data for the guest.
 
 ## Debugging HQ
+
+![demo](demo/screen.png)
 
 Launch the interactive debugger with:
 
