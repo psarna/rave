@@ -84,6 +84,7 @@ const FUNCT_CSRRSI: u32 = 6;
 const FUNCT_CSRRCI: u32 = 7;
 
 const FUNCT7_BASE: u32 = 0;
+const FUNCT7_MULTIPLY: u32 = 1;
 const FUNCT7_ALTERNATE: u32 = 0x20;
 const SHIFT64_LOGICAL_PREFIX: u32 = 0;
 const SHIFT64_ARITHMETIC_PREFIX: u32 = 0x10;
@@ -377,16 +378,24 @@ impl Cpu {
         let value = match (instruction.funct3, instruction.funct7) {
             (FUNCT_ADD, FUNCT7_BASE) => lhs.wrapping_add(rhs),
             (FUNCT_ADD, FUNCT7_ALTERNATE) => lhs.wrapping_sub(rhs),
+            (FUNCT_ADD, FUNCT7_MULTIPLY) => lhs.wrapping_mul(rhs),
             (FUNCT_SHIFT_LEFT, FUNCT7_BASE) => lhs << (rhs & u64::from(SHIFT64_MASK)),
+            (FUNCT_SHIFT_LEFT, FUNCT7_MULTIPLY) => mulh(lhs, rhs),
             (FUNCT_SET_LESS_THAN, FUNCT7_BASE) => ((lhs as i64) < (rhs as i64)) as u64,
+            (FUNCT_SET_LESS_THAN, FUNCT7_MULTIPLY) => mulhsu(lhs, rhs),
             (FUNCT_SET_LESS_THAN_UNSIGNED, FUNCT7_BASE) => (lhs < rhs) as u64,
+            (FUNCT_SET_LESS_THAN_UNSIGNED, FUNCT7_MULTIPLY) => mulhu(lhs, rhs),
             (FUNCT_XOR, FUNCT7_BASE) => lhs ^ rhs,
+            (FUNCT_XOR, FUNCT7_MULTIPLY) => div(lhs, rhs),
             (FUNCT_SHIFT_RIGHT, FUNCT7_BASE) => lhs >> (rhs & u64::from(SHIFT64_MASK)),
             (FUNCT_SHIFT_RIGHT, FUNCT7_ALTERNATE) => {
                 ((lhs as i64) >> (rhs & u64::from(SHIFT64_MASK))) as u64
             }
+            (FUNCT_SHIFT_RIGHT, FUNCT7_MULTIPLY) => divu(lhs, rhs),
             (FUNCT_OR, FUNCT7_BASE) => lhs | rhs,
+            (FUNCT_OR, FUNCT7_MULTIPLY) => rem(lhs, rhs),
             (FUNCT_AND, FUNCT7_BASE) => lhs & rhs,
+            (FUNCT_AND, FUNCT7_MULTIPLY) => remu(lhs, rhs),
             _ => return Err(illegal(self.pc, instruction.raw)),
         };
         self.set_register(instruction.rd, value);
@@ -403,11 +412,16 @@ impl Cpu {
         let word = match (instruction.funct3, instruction.funct7) {
             (FUNCT_ADD, FUNCT7_BASE) => lhs.wrapping_add(rhs as u32),
             (FUNCT_ADD, FUNCT7_ALTERNATE) => lhs.wrapping_sub(rhs as u32),
+            (FUNCT_ADD, FUNCT7_MULTIPLY) => lhs.wrapping_mul(rhs as u32),
             (FUNCT_SHIFT_LEFT, FUNCT7_BASE) => lhs << (rhs & u64::from(SHIFT32_MASK)),
+            (FUNCT_XOR, FUNCT7_MULTIPLY) => divw(lhs, rhs as u32),
             (FUNCT_SHIFT_RIGHT, FUNCT7_BASE) => lhs >> (rhs & u64::from(SHIFT32_MASK)),
             (FUNCT_SHIFT_RIGHT, FUNCT7_ALTERNATE) => {
                 ((lhs as i32) >> (rhs & u64::from(SHIFT32_MASK))) as u32
             }
+            (FUNCT_SHIFT_RIGHT, FUNCT7_MULTIPLY) => divuw(lhs, rhs as u32),
+            (FUNCT_OR, FUNCT7_MULTIPLY) => remw(lhs, rhs as u32),
+            (FUNCT_AND, FUNCT7_MULTIPLY) => remuw(lhs, rhs as u32),
             _ => return Err(illegal(self.pc, instruction.raw)),
         };
         self.set_register(instruction.rd, sign_extend_word(word));
@@ -510,6 +524,98 @@ fn sign_extend_word(value: u32) -> u64 {
     value as i32 as i64 as u64
 }
 
+fn mulh(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as i64 as i128) * (rhs as i64 as i128)) >> XLEN_BITS) as u64
+}
+
+fn mulhsu(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as i64 as i128) * (rhs as u128 as i128)) >> XLEN_BITS) as u64
+}
+
+fn mulhu(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as u128) * (rhs as u128)) >> XLEN_BITS) as u64
+}
+
+fn div(lhs: u64, rhs: u64) -> u64 {
+    let dividend = lhs as i64;
+    let divisor = rhs as i64;
+    if divisor == 0 {
+        u64::MAX
+    } else if dividend == i64::MIN && divisor == -1 {
+        lhs
+    } else {
+        dividend.wrapping_div(divisor) as u64
+    }
+}
+
+fn divu(lhs: u64, rhs: u64) -> u64 {
+    if rhs == 0 {
+        u64::MAX
+    } else {
+        lhs / rhs
+    }
+}
+
+fn rem(lhs: u64, rhs: u64) -> u64 {
+    let dividend = lhs as i64;
+    let divisor = rhs as i64;
+    if divisor == 0 {
+        lhs
+    } else if dividend == i64::MIN && divisor == -1 {
+        0
+    } else {
+        dividend.wrapping_rem(divisor) as u64
+    }
+}
+
+fn remu(lhs: u64, rhs: u64) -> u64 {
+    if rhs == 0 {
+        lhs
+    } else {
+        lhs % rhs
+    }
+}
+
+fn divw(lhs: u32, rhs: u32) -> u32 {
+    let dividend = lhs as i32;
+    let divisor = rhs as i32;
+    if divisor == 0 {
+        u32::MAX
+    } else if dividend == i32::MIN && divisor == -1 {
+        lhs
+    } else {
+        dividend.wrapping_div(divisor) as u32
+    }
+}
+
+fn divuw(lhs: u32, rhs: u32) -> u32 {
+    if rhs == 0 {
+        u32::MAX
+    } else {
+        lhs / rhs
+    }
+}
+
+fn remw(lhs: u32, rhs: u32) -> u32 {
+    let dividend = lhs as i32;
+    let divisor = rhs as i32;
+    if divisor == 0 {
+        lhs
+    } else if dividend == i32::MIN && divisor == -1 {
+        0
+    } else {
+        dividend.wrapping_rem(divisor) as u32
+    }
+}
+
+fn remuw(lhs: u32, rhs: u32) -> u32 {
+    if rhs == 0 {
+        lhs
+    } else {
+        lhs % rhs
+    }
+}
+
 fn upper_immediate(instruction: u32) -> u64 {
     sign_extend_u64(
         (instruction & UPPER_IMMEDIATE_MASK) as u64,
@@ -577,6 +683,134 @@ mod tests {
         bus.write_u32(DRAM_START, 0x0010_809b).unwrap(); // addiw x1, x1, 1
         cpu.step(&mut bus).unwrap();
         assert_eq!(cpu.register(1), 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn rv64m_multiplies_low_and_high_halves() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(32);
+        cpu.set_register(1, 0xffff_ffff_ffff_fffe);
+        cpu.set_register(2, 3);
+        bus.write_u32(DRAM_START, encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_ADD, 5))
+            .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_SHIFT_LEFT, 6),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_SET_LESS_THAN, 7),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 3,
+            encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_SET_LESS_THAN_UNSIGNED, 8),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 0xffff_ffff_ffff_fffa);
+        assert_eq!(cpu.register(6), 0xffff_ffff_ffff_ffff);
+        assert_eq!(cpu.register(7), 0xffff_ffff_ffff_ffff);
+        assert_eq!(cpu.register(8), 2);
+    }
+
+    #[test]
+    fn rv64m_division_and_remainder_follow_edge_case_rules() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(32);
+        cpu.set_register(1, 0xffff_ffff_ffff_fff9);
+        cpu.set_register(2, 3);
+        cpu.set_register(3, 0);
+        bus.write_u32(DRAM_START, encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_XOR, 5))
+            .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_OR, 6),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_r(FUNCT7_MULTIPLY, 3, 1, FUNCT_XOR, 7),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 3,
+            encode_r(FUNCT7_MULTIPLY, 3, 1, FUNCT_OR, 8),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), (-2_i64) as u64);
+        assert_eq!(cpu.register(6), (-1_i64) as u64);
+        assert_eq!(cpu.register(7), u64::MAX);
+        assert_eq!(cpu.register(8), 0xffff_ffff_ffff_fff9);
+    }
+
+    #[test]
+    fn rv64m_signed_division_overflow_returns_specified_values() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        cpu.set_register(1, i64::MIN as u64);
+        cpu.set_register(2, u64::MAX);
+        bus.write_u32(DRAM_START, encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_XOR, 5))
+            .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_r(FUNCT7_MULTIPLY, 2, 1, FUNCT_OR, 6),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), i64::MIN as u64);
+        assert_eq!(cpu.register(6), 0);
+    }
+
+    #[test]
+    fn rv64m_word_operations_sign_extend_results() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(32);
+        cpu.set_register(1, 0x0000_0000_8000_0000);
+        cpu.set_register(2, 0xffff_ffff_ffff_ffff);
+        cpu.set_register(3, 0);
+        bus.write_u32(DRAM_START, encode_r32(FUNCT7_MULTIPLY, 2, 1, FUNCT_ADD, 5))
+            .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_r32(FUNCT7_MULTIPLY, 2, 1, FUNCT_XOR, 6),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_r32(FUNCT7_MULTIPLY, 2, 1, FUNCT_OR, 7),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 3,
+            encode_r32(FUNCT7_MULTIPLY, 3, 1, FUNCT_SHIFT_RIGHT, 8),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 0xffff_ffff_8000_0000);
+        assert_eq!(cpu.register(6), 0xffff_ffff_8000_0000);
+        assert_eq!(cpu.register(7), 0);
+        assert_eq!(cpu.register(8), u64::MAX);
     }
 
     #[test]
@@ -676,6 +910,24 @@ mod tests {
                 instruction,
             })
         );
+    }
+
+    fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct7 << FUNCT7_SHIFT)
+            | (rs2 << RS2_SHIFT)
+            | (rs1 << RS1_SHIFT)
+            | (funct3 << FUNCT3_SHIFT)
+            | (rd << RD_SHIFT)
+            | OPCODE_OP
+    }
+
+    fn encode_r32(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct7 << FUNCT7_SHIFT)
+            | (rs2 << RS2_SHIFT)
+            | (rs1 << RS1_SHIFT)
+            | (funct3 << FUNCT3_SHIFT)
+            | (rd << RD_SHIFT)
+            | OPCODE_OP_32
     }
 
     fn encode_csr(csr: u32, funct3: u32, rs1: u32, rd: u32) -> u32 {
