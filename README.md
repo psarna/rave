@@ -2,10 +2,11 @@
 
 ![logo](demo/rave.png)
 
-A minimal RV64I (more letters coming!) emulator
+A minimal RV64I_Zicsr (more letters coming!) emulator
 
 - 32 integer registers and an explicit program counter
 - base RV64I integer, branch, jump, and load/store instructions
+- Zicsr CSR read/write, set, and clear instructions
 - RV64 word operations with 32-bit sign extension
 - raw binaries loaded into DRAM at `0x8000_0000`
 - `ebreak` as a temporary host exit boundary; register `a0` is the result code
@@ -64,5 +65,5 @@ register, receive-buffer reads, data-ready status, and transmitter-ready line
 status. Other device regions are
 explicit stubs for now.
 
-Compressed instructions, privileged modes, CSRs, virtual memory,
+Compressed instructions, privileged modes, virtual memory,
 interrupts, and functional devices are intentionally not here yet.
