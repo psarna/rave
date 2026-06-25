@@ -93,6 +93,7 @@ const SHIFT32_MASK: u32 = 0x1f;
 
 const INSTRUCTION_ECALL: u32 = 0x0000_0073;
 const INSTRUCTION_EBREAK: u32 = 0x0010_0073;
+const INSTRUCTION_FENCE_I: u32 = 0x0000_100f;
 const UPPER_IMMEDIATE_MASK: u32 = 0xffff_f000;
 const JALR_ALIGNMENT_MASK: u64 = !1;
 
@@ -429,7 +430,7 @@ impl Cpu {
     }
 
     fn execute_misc_mem(&self, instruction: Decoded, next_pc: u64) -> Result<Execution, StepError> {
-        if instruction.funct3 == FUNCT_ADD {
+        if instruction.funct3 == FUNCT_ADD || instruction.raw == INSTRUCTION_FENCE_I {
             Ok(Execution::Continue { next_pc })
         } else {
             Err(illegal(self.pc, instruction.raw))
@@ -683,6 +684,33 @@ mod tests {
         bus.write_u32(DRAM_START, 0x0010_809b).unwrap(); // addiw x1, x1, 1
         cpu.step(&mut bus).unwrap();
         assert_eq!(cpu.register(1), 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn fence_i_is_a_validated_noop() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        bus.write_u32(DRAM_START, INSTRUCTION_FENCE_I).unwrap();
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.pc, DRAM_START + INSTRUCTION_SIZE);
+    }
+
+    #[test]
+    fn non_canonical_fence_i_is_illegal() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        let instruction = INSTRUCTION_FENCE_I | (1 << RD_SHIFT);
+        bus.write_u32(DRAM_START, instruction).unwrap();
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(StepError::IllegalInstruction {
+                pc: DRAM_START,
+                instruction,
+            })
+        );
     }
 
     #[test]
