@@ -2,7 +2,6 @@ use crate::{Bus, BusError};
 use std::fmt;
 
 const REGISTER_COUNT: usize = 32;
-const CSR_COUNT: usize = 4096;
 const ZERO_REGISTER: usize = 0;
 const RETURN_VALUE_REGISTER: usize = 10;
 const INSTRUCTION_SIZE: u64 = 4;
@@ -97,6 +96,33 @@ const INSTRUCTION_FENCE_I: u32 = 0x0000_100f;
 const UPPER_IMMEDIATE_MASK: u32 = 0xffff_f000;
 const JALR_ALIGNMENT_MASK: u64 = !1;
 
+const CSR_MVENDORID: u16 = 0xf11;
+const CSR_MARCHID: u16 = 0xf12;
+const CSR_MIMPID: u16 = 0xf13;
+const CSR_MHARTID: u16 = 0xf14;
+const CSR_MSTATUS: u16 = 0x300;
+const CSR_MISA: u16 = 0x301;
+const CSR_MIE: u16 = 0x304;
+const CSR_MTVEC: u16 = 0x305;
+const CSR_MSCRATCH: u16 = 0x340;
+const CSR_MEPC: u16 = 0x341;
+const CSR_MCAUSE: u16 = 0x342;
+const CSR_MTVAL: u16 = 0x343;
+const CSR_MIP: u16 = 0x344;
+const CSR_CYCLE: u16 = 0xc00;
+const CSR_TIME: u16 = 0xc01;
+const CSR_INSTRET: u16 = 0xc02;
+
+const MSTATUS_WRITABLE_MASK: u64 = (1 << 3) | (1 << 7) | (0b11 << 11);
+const MIE_WRITABLE_MASK: u64 = (1 << 3) | (1 << 7) | (1 << 11);
+const MIP_WRITABLE_MASK: u64 = 0;
+const MTVEC_WRITABLE_MASK: u64 = !0b10;
+const MEPC_WRITABLE_MASK: u64 = !1;
+const MCAUSE_WRITABLE_MASK: u64 = u64::MAX;
+const MTVAL_WRITABLE_MASK: u64 = u64::MAX;
+const MSCRATCH_WRITABLE_MASK: u64 = u64::MAX;
+const MISA_VALUE: u64 = (2 << 62) | (1 << 8) | (1 << 12);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltReason {
     Breakpoint { code: u64 },
@@ -132,8 +158,22 @@ impl From<BusError> for StepError {
 #[derive(Debug, Clone)]
 pub struct Cpu {
     registers: [u64; REGISTER_COUNT],
-    csrs: [u64; CSR_COUNT],
+    csrs: CsrFile,
     pub pc: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CsrFile {
+    mstatus: u64,
+    mie: u64,
+    mtvec: u64,
+    mscratch: u64,
+    mepc: u64,
+    mcause: u64,
+    mtval: u64,
+    mip: u64,
+    cycle: u64,
+    instret: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -170,7 +210,7 @@ impl Cpu {
     pub fn new(pc: u64) -> Self {
         Self {
             registers: [0; REGISTER_COUNT],
-            csrs: [0; CSR_COUNT],
+            csrs: CsrFile::default(),
             pc,
         }
     }
@@ -186,7 +226,7 @@ impl Cpu {
     }
 
     pub fn csr(&self, address: u16) -> u64 {
-        self.csrs[usize::from(address)]
+        self.csrs.read(address).unwrap_or(0)
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<Option<HaltReason>, StepError> {
@@ -213,6 +253,7 @@ impl Cpu {
 
         match execution {
             Execution::Continue { next_pc } => {
+                self.csrs.retire_instruction();
                 self.pc = next_pc;
                 self.registers[ZERO_REGISTER] = 0;
                 Ok(None)
@@ -450,7 +491,10 @@ impl Cpu {
 
     fn execute_csr(&mut self, instruction: Decoded, pc: u64) -> Result<Execution, StepError> {
         let address = csr_address(instruction.raw);
-        let old_value = self.csrs[address];
+        let old_value = self
+            .csrs
+            .read(address)
+            .ok_or_else(|| illegal(pc, instruction.raw))?;
         let register_operand = self.registers[instruction.rs1];
         let immediate_operand = instruction.rs1 as u64;
 
@@ -477,10 +521,12 @@ impl Cpu {
         };
 
         if write {
-            if csr_is_read_only(address) {
+            if self.csrs.is_read_only(address) {
                 return Err(illegal(pc, instruction.raw));
             }
-            self.csrs[address] = new_value;
+            self.csrs
+                .write(address, new_value)
+                .ok_or_else(|| illegal(pc, instruction.raw))?;
         }
         self.set_register(instruction.rd, old_value);
         Ok(Execution::Continue {
@@ -501,12 +547,63 @@ fn bits(value: u32, shift: u32, width: u32) -> u32 {
     (value >> shift) & ((1 << width) - 1)
 }
 
-fn csr_address(instruction: u32) -> usize {
-    bits(instruction, CSR_SHIFT, CSR_BITS) as usize
+fn csr_address(instruction: u32) -> u16 {
+    bits(instruction, CSR_SHIFT, CSR_BITS) as u16
 }
 
-fn csr_is_read_only(address: usize) -> bool {
-    address >> 10 == 0b11
+impl CsrFile {
+    fn read(&self, address: u16) -> Option<u64> {
+        match address {
+            CSR_MVENDORID | CSR_MARCHID | CSR_MIMPID | CSR_MHARTID => Some(0),
+            CSR_MSTATUS => Some(self.mstatus),
+            CSR_MISA => Some(MISA_VALUE),
+            CSR_MIE => Some(self.mie),
+            CSR_MTVEC => Some(self.mtvec),
+            CSR_MSCRATCH => Some(self.mscratch),
+            CSR_MEPC => Some(self.mepc),
+            CSR_MCAUSE => Some(self.mcause),
+            CSR_MTVAL => Some(self.mtval),
+            CSR_MIP => Some(self.mip),
+            CSR_CYCLE => Some(self.cycle),
+            CSR_TIME => Some(self.cycle),
+            CSR_INSTRET => Some(self.instret),
+            _ => None,
+        }
+    }
+
+    fn write(&mut self, address: u16, value: u64) -> Option<()> {
+        match address {
+            CSR_MSTATUS => self.mstatus = value & MSTATUS_WRITABLE_MASK,
+            CSR_MIE => self.mie = value & MIE_WRITABLE_MASK,
+            CSR_MTVEC => self.mtvec = value & MTVEC_WRITABLE_MASK,
+            CSR_MSCRATCH => self.mscratch = value & MSCRATCH_WRITABLE_MASK,
+            CSR_MEPC => self.mepc = value & MEPC_WRITABLE_MASK,
+            CSR_MCAUSE => self.mcause = value & MCAUSE_WRITABLE_MASK,
+            CSR_MTVAL => self.mtval = value & MTVAL_WRITABLE_MASK,
+            CSR_MIP => self.mip = value & MIP_WRITABLE_MASK,
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn is_read_only(&self, address: u16) -> bool {
+        matches!(
+            address,
+            CSR_MVENDORID
+                | CSR_MARCHID
+                | CSR_MIMPID
+                | CSR_MHARTID
+                | CSR_MISA
+                | CSR_CYCLE
+                | CSR_TIME
+                | CSR_INSTRET
+        )
+    }
+
+    fn retire_instruction(&mut self) {
+        self.cycle = self.cycle.wrapping_add(1);
+        self.instret = self.instret.wrapping_add(1);
+    }
 }
 
 fn illegal(pc: u64, instruction: u32) -> StepError {
@@ -842,93 +939,222 @@ mod tests {
     }
 
     #[test]
-    fn csrrw_swaps_register_and_csr_values() {
+    fn csrrw_swaps_register_and_machine_csr_values() {
         let mut cpu = Cpu::new(DRAM_START);
-        let mut bus = Bus::new(8);
-        cpu.csrs[0x100] = 0xaaaa;
-        cpu.set_register(6, 0x5555);
-        bus.write_u32(DRAM_START, encode_csr(0x100, FUNCT_CSRRW, 6, 5))
-            .unwrap();
+        let mut bus = Bus::new(16);
+        cpu.set_register(6, 0xaaaa);
+        cpu.set_register(7, 0x5555);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRW, 6, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRW, 7, 5),
+        )
+        .unwrap();
 
+        cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.register(5), 0xaaaa);
-        assert_eq!(cpu.csr(0x100), 0x5555);
-        assert_eq!(cpu.pc, DRAM_START + INSTRUCTION_SIZE);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0x5555);
     }
 
     #[test]
     fn csrrs_and_csrrc_update_with_register_masks() {
         let mut cpu = Cpu::new(DRAM_START);
-        let mut bus = Bus::new(16);
-        cpu.csrs[0x100] = 0b1010;
+        let mut bus = Bus::new(24);
+        cpu.set_register(5, 0b1010);
         cpu.set_register(6, 0b0101);
-        bus.write_u32(DRAM_START, encode_csr(0x100, FUNCT_CSRRS, 6, 5))
-            .unwrap();
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRW, 5, 0),
+        )
+        .unwrap();
         bus.write_u32(
             DRAM_START + INSTRUCTION_SIZE,
-            encode_csr(0x100, FUNCT_CSRRC, 6, 7),
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRS, 6, 7),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRC, 6, 8),
         )
         .unwrap();
 
         cpu.step(&mut bus).unwrap();
-        assert_eq!(cpu.register(5), 0b1010);
-        assert_eq!(cpu.csr(0x100), 0b1111);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.register(7), 0b1010);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0b1111);
 
         cpu.step(&mut bus).unwrap();
-        assert_eq!(cpu.register(7), 0b1111);
-        assert_eq!(cpu.csr(0x100), 0b1010);
+        assert_eq!(cpu.register(8), 0b1111);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0b1010);
     }
 
     #[test]
     fn csr_zero_masks_read_without_writing() {
         let mut cpu = Cpu::new(DRAM_START);
-        let mut bus = Bus::new(16);
-        cpu.csrs[0x100] = 0x1234;
-        cpu.set_register(1, 0xffff);
-        bus.write_u32(DRAM_START, encode_csr(0x100, FUNCT_CSRRS, 0, 5))
-            .unwrap();
+        let mut bus = Bus::new(24);
+        cpu.set_register(1, 0x1234);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
         bus.write_u32(
             DRAM_START + INSTRUCTION_SIZE,
-            encode_csr(0x100, FUNCT_CSRRSI, 0, 6),
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRS, 0, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRSI, 0, 6),
         )
         .unwrap();
 
+        cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.register(5), 0x1234);
         assert_eq!(cpu.register(6), 0x1234);
-        assert_eq!(cpu.csr(0x100), 0x1234);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0x1234);
     }
 
     #[test]
     fn csr_immediate_instructions_use_rs1_field_as_zimm() {
         let mut cpu = Cpu::new(DRAM_START);
-        let mut bus = Bus::new(16);
-        cpu.csrs[0x100] = 0b1010;
-        bus.write_u32(DRAM_START, encode_csr(0x100, FUNCT_CSRRSI, 0b0011, 5))
-            .unwrap();
+        let mut bus = Bus::new(24);
+        cpu.set_register(1, 0b1010);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
         bus.write_u32(
             DRAM_START + INSTRUCTION_SIZE,
-            encode_csr(0x100, FUNCT_CSRRCI, 0b0110, 6),
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRSI, 0b0011, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRCI, 0b0110, 6),
         )
         .unwrap();
 
         cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
         assert_eq!(cpu.register(5), 0b1010);
-        assert_eq!(cpu.csr(0x100), 0b1011);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0b1011);
 
         cpu.step(&mut bus).unwrap();
         assert_eq!(cpu.register(6), 0b1011);
-        assert_eq!(cpu.csr(0x100), 0b1001);
+        assert_eq!(cpu.csr(CSR_MSCRATCH), 0b1001);
+    }
+
+    #[test]
+    fn machine_csr_writes_apply_warl_masks() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(24);
+        cpu.set_register(1, u64::MAX);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MSTATUS), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_csr(u32::from(CSR_MTVEC), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_MEPC), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.csr(CSR_MSTATUS), MSTATUS_WRITABLE_MASK);
+        assert_eq!(cpu.csr(CSR_MTVEC), u64::MAX & MTVEC_WRITABLE_MASK);
+        assert_eq!(cpu.csr(CSR_MEPC), u64::MAX & MEPC_WRITABLE_MASK);
+    }
+
+    #[test]
+    fn machine_identity_csrs_are_readable() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MISA), FUNCT_CSRRS, 0, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_csr(u32::from(CSR_MHARTID), FUNCT_CSRRS, 0, 6),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), MISA_VALUE);
+        assert_eq!(cpu.register(6), 0);
+    }
+
+    #[test]
+    fn counters_track_successfully_retired_instructions() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        bus.write_u32(DRAM_START, 0x0010_8093).unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_csr(u32::from(CSR_CYCLE), FUNCT_CSRRS, 0, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_INSTRET), FUNCT_CSRRS, 0, 6),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 1);
+        assert_eq!(cpu.register(6), 2);
+        assert_eq!(cpu.csr(CSR_CYCLE), 3);
+        assert_eq!(cpu.csr(CSR_TIME), 3);
     }
 
     #[test]
     fn writing_read_only_csr_is_illegal() {
         let mut cpu = Cpu::new(DRAM_START);
         let mut bus = Bus::new(8);
-        let instruction = encode_csr(0xc00, FUNCT_CSRRW, 1, 0);
+        let instruction = encode_csr(u32::from(CSR_CYCLE), FUNCT_CSRRW, 1, 0);
+        bus.write_u32(DRAM_START, instruction).unwrap();
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(StepError::IllegalInstruction {
+                pc: DRAM_START,
+                instruction,
+            })
+        );
+        assert_eq!(cpu.csr(CSR_CYCLE), 0);
+    }
+
+    #[test]
+    fn unknown_csr_access_is_illegal() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        let instruction = encode_csr(0x100, FUNCT_CSRRS, 0, 5);
         bus.write_u32(DRAM_START, instruction).unwrap();
 
         assert_eq!(
