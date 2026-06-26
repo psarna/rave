@@ -70,6 +70,22 @@ enum AluRhs {
     Immediate(i64),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CsrInfo {
+    mnemonic: &'static str,
+    rd: usize,
+    csr: u16,
+    operand: CsrOperand,
+    old_value: u64,
+    new_value: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CsrOperand {
+    Register(usize),
+    Immediate(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitChord {
     ControlC,
@@ -571,6 +587,46 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                                     base.patch(Style::default().fg(Color::Cyan)),
                                 ),
                             ]);
+                        } else if let Some(csr) = decode_csr(instruction, debugger) {
+                            let rd_name = if csr.rd == 0 {
+                                "zero"
+                            } else {
+                                REGISTER_NAMES[csr.rd]
+                            };
+                            let operand_name = match csr.operand {
+                                CsrOperand::Register(rs1) => REGISTER_NAMES[rs1].to_string(),
+                                CsrOperand::Immediate(value) => value.to_string(),
+                            };
+                            spans.extend([
+                                Span::styled(
+                                    format!(
+                                        "{} {},{},{} [old ",
+                                        csr.mnemonic,
+                                        rd_name,
+                                        csr_name(csr.csr),
+                                        operand_name
+                                    ),
+                                    base,
+                                ),
+                                Span::styled(
+                                    format!("{:#x}", csr.old_value),
+                                    base.patch(Style::default().fg(Color::Yellow)),
+                                ),
+                                Span::styled("] -> ", base),
+                                Span::styled(
+                                    format!("{}={:#018x}", rd_name, csr.old_value),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
+                            if let Some(new_value) = csr.new_value {
+                                spans.extend([
+                                    Span::styled(", ", base),
+                                    Span::styled(
+                                        format!("{}={:#018x}", csr_name(csr.csr), new_value),
+                                        base.patch(Style::default().fg(Color::Cyan)),
+                                    ),
+                                ]);
+                            }
                         }
                     }
                 }
@@ -986,6 +1042,176 @@ fn decode_mem(instruction: u32, debugger: &Debugger) -> Option<MemInfo> {
     })
 }
 
+fn csr_name(address: u16) -> String {
+    match address {
+        0x300 => "mstatus".into(),
+        0x301 => "misa".into(),
+        0x304 => "mie".into(),
+        0x305 => "mtvec".into(),
+        0x340 => "mscratch".into(),
+        0x341 => "mepc".into(),
+        0x342 => "mcause".into(),
+        0x343 => "mtval".into(),
+        0x344 => "mip".into(),
+        0xc00 => "cycle".into(),
+        0xc01 => "time".into(),
+        0xc02 => "instret".into(),
+        0xf11 => "mvendorid".into(),
+        0xf12 => "marchid".into(),
+        0xf13 => "mimpid".into(),
+        0xf14 => "mhartid".into(),
+        _ => format!("{address:#05x}"),
+    }
+}
+
+fn decode_csr(instruction: u32, debugger: &Debugger) -> Option<CsrInfo> {
+    if instruction & 0x7f != 0x73 {
+        return None;
+    }
+    let rd = ((instruction >> 7) & 0x1f) as usize;
+    let funct3 = (instruction >> 12) & 0x7;
+    let rs1 = ((instruction >> 15) & 0x1f) as usize;
+    let csr = ((instruction >> 20) & 0xfff) as u16;
+    let old_value = debugger.machine.cpu.csr(csr);
+    let register_operand = debugger.machine.cpu.register(rs1);
+    let immediate_operand = rs1 as u64;
+
+    let (mnemonic, operand, new_value) = match funct3 {
+        1 => ("csrrw", CsrOperand::Register(rs1), Some(register_operand)),
+        2 => (
+            "csrrs",
+            CsrOperand::Register(rs1),
+            (rs1 != 0).then_some(old_value | register_operand),
+        ),
+        3 => (
+            "csrrc",
+            CsrOperand::Register(rs1),
+            (rs1 != 0).then_some(old_value & !register_operand),
+        ),
+        5 => (
+            "csrrwi",
+            CsrOperand::Immediate(immediate_operand),
+            Some(immediate_operand),
+        ),
+        6 => (
+            "csrrsi",
+            CsrOperand::Immediate(immediate_operand),
+            (rs1 != 0).then_some(old_value | immediate_operand),
+        ),
+        7 => (
+            "csrrci",
+            CsrOperand::Immediate(immediate_operand),
+            (rs1 != 0).then_some(old_value & !immediate_operand),
+        ),
+        _ => return None,
+    };
+
+    Some(CsrInfo {
+        mnemonic,
+        rd,
+        csr,
+        operand,
+        old_value,
+        new_value,
+    })
+}
+
+fn sign_extend_word(value: u32) -> u64 {
+    value as i32 as i64 as u64
+}
+
+fn mulh(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as i64 as i128) * (rhs as i64 as i128)) >> 64) as u64
+}
+
+fn mulhsu(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as i64 as i128) * (rhs as u128 as i128)) >> 64) as u64
+}
+
+fn mulhu(lhs: u64, rhs: u64) -> u64 {
+    (((lhs as u128) * (rhs as u128)) >> 64) as u64
+}
+
+fn div(lhs: u64, rhs: u64) -> u64 {
+    let dividend = lhs as i64;
+    let divisor = rhs as i64;
+    if divisor == 0 {
+        u64::MAX
+    } else if dividend == i64::MIN && divisor == -1 {
+        lhs
+    } else {
+        dividend.wrapping_div(divisor) as u64
+    }
+}
+
+fn divu(lhs: u64, rhs: u64) -> u64 {
+    if rhs == 0 {
+        u64::MAX
+    } else {
+        lhs / rhs
+    }
+}
+
+fn rem(lhs: u64, rhs: u64) -> u64 {
+    let dividend = lhs as i64;
+    let divisor = rhs as i64;
+    if divisor == 0 {
+        lhs
+    } else if dividend == i64::MIN && divisor == -1 {
+        0
+    } else {
+        dividend.wrapping_rem(divisor) as u64
+    }
+}
+
+fn remu(lhs: u64, rhs: u64) -> u64 {
+    if rhs == 0 {
+        lhs
+    } else {
+        lhs % rhs
+    }
+}
+
+fn divw(lhs: u32, rhs: u32) -> u32 {
+    let dividend = lhs as i32;
+    let divisor = rhs as i32;
+    if divisor == 0 {
+        u32::MAX
+    } else if dividend == i32::MIN && divisor == -1 {
+        lhs
+    } else {
+        dividend.wrapping_div(divisor) as u32
+    }
+}
+
+fn divuw(lhs: u32, rhs: u32) -> u32 {
+    if rhs == 0 {
+        u32::MAX
+    } else {
+        lhs / rhs
+    }
+}
+
+fn remw(lhs: u32, rhs: u32) -> u32 {
+    let dividend = lhs as i32;
+    let divisor = rhs as i32;
+    if divisor == 0 {
+        lhs
+    } else if dividend == i32::MIN && divisor == -1 {
+        0
+    } else {
+        dividend.wrapping_rem(divisor) as u32
+    }
+}
+
+fn remuw(lhs: u32, rhs: u32) -> u32 {
+    if rhs == 0 {
+        lhs
+    } else {
+        lhs % rhs
+    }
+}
+
 fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
     let opcode = instruction & 0x7f;
     let rd = ((instruction >> 7) & 0x1f) as usize;
@@ -1040,17 +1266,51 @@ fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
         let (mnemonic, result, operator) = match (funct3, funct7) {
             (0, 0) => ("add", lhs.wrapping_add(rhs_val), "+"),
             (0, 0x20) => ("sub", lhs.wrapping_sub(rhs_val), "-"),
+            (0, 1) => ("mul", lhs.wrapping_mul(rhs_val), "*"),
             (1, 0) => ("sll", lhs << shift, "<<"),
+            (1, 1) => ("mulh", mulh(lhs, rhs_val), "*h"),
             (2, 0) => ("slt", ((lhs as i64) < (rhs_val as i64)) as u64, "<s"),
+            (2, 1) => ("mulhsu", mulhsu(lhs, rhs_val), "*hsu"),
             (3, 0) => ("sltu", (lhs < rhs_val) as u64, "<u"),
+            (3, 1) => ("mulhu", mulhu(lhs, rhs_val), "*hu"),
             (4, 0) => ("xor", lhs ^ rhs_val, "^"),
+            (4, 1) => ("div", div(lhs, rhs_val), "/s"),
             (5, 0) => ("srl", lhs >> shift, ">>"),
             (5, 0x20) => ("sra", ((lhs as i64) >> shift) as u64, ">>s"),
+            (5, 1) => ("divu", divu(lhs, rhs_val), "/u"),
             (6, 0) => ("or", lhs | rhs_val, "|"),
+            (6, 1) => ("rem", rem(lhs, rhs_val), "%s"),
             (7, 0) => ("and", lhs & rhs_val, "&"),
+            (7, 1) => ("remu", remu(lhs, rhs_val), "%u"),
             _ => return None,
         };
         (mnemonic, AluRhs::Register(rs2), result, operator)
+    } else if opcode == 0x3b {
+        let rs2 = ((instruction >> 20) & 0x1f) as usize;
+        let rhs_val = debugger.machine.cpu.register(rs2);
+        let lhs_word = lhs as u32;
+        let rhs_word = rhs_val as u32;
+        let funct7 = (instruction >> 25) & 0x7f;
+        let shift = rhs_val & 0x1f;
+        let (mnemonic, word, operator) = match (funct3, funct7) {
+            (0, 0) => ("addw", lhs_word.wrapping_add(rhs_word), "+w"),
+            (0, 0x20) => ("subw", lhs_word.wrapping_sub(rhs_word), "-w"),
+            (0, 1) => ("mulw", lhs_word.wrapping_mul(rhs_word), "*w"),
+            (1, 0) => ("sllw", lhs_word << shift, "<<w"),
+            (4, 1) => ("divw", divw(lhs_word, rhs_word), "/sw"),
+            (5, 0) => ("srlw", lhs_word >> shift, ">>w"),
+            (5, 0x20) => ("sraw", ((lhs_word as i32) >> shift) as u32, ">>sw"),
+            (5, 1) => ("divuw", divuw(lhs_word, rhs_word), "/uw"),
+            (6, 1) => ("remw", remw(lhs_word, rhs_word), "%sw"),
+            (7, 1) => ("remuw", remuw(lhs_word, rhs_word), "%uw"),
+            _ => return None,
+        };
+        (
+            mnemonic,
+            AluRhs::Register(rs2),
+            sign_extend_word(word),
+            operator,
+        )
     } else {
         return None;
     };
@@ -1084,6 +1344,10 @@ mod tests {
             | (funct3 << 12)
             | ((immediate & 0x1f) << 7)
             | 0x23
+    }
+
+    fn csr_type(csr: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
     }
 
     fn debugger() -> Debugger {
@@ -1272,6 +1536,76 @@ mod tests {
         let sra = decode_alu(r_type(0x20, 2, 1, 5, 3), &debugger).unwrap();
         assert_eq!(sra.mnemonic, "sra");
         assert_eq!(sra.result, 0xc000_0000_0000_0000);
+    }
+
+    #[test]
+    fn csr_decoder_previews_register_and_immediate_forms() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(5, 0x1200);
+        debugger.machine.cpu.set_register(6, 0x34);
+
+        let write = decode_csr(csr_type(0x340, 5, 1, 0), &debugger).unwrap();
+        assert_eq!(write.mnemonic, "csrrw");
+        assert_eq!(write.csr, 0x340);
+        assert_eq!(write.operand, CsrOperand::Register(5));
+        assert_eq!(write.old_value, 0);
+        assert_eq!(write.new_value, Some(0x1200));
+
+        let read = decode_csr(csr_type(0x301, 0, 6, 10), &debugger).unwrap();
+        assert_eq!(read.mnemonic, "csrrsi");
+        assert_eq!(read.csr, 0x301);
+        assert_eq!(read.operand, CsrOperand::Immediate(0));
+        assert_ne!(read.old_value, 0);
+        assert_eq!(read.new_value, None);
+    }
+
+    #[test]
+    fn csr_name_prefers_known_machine_names() {
+        assert_eq!(csr_name(0x340), "mscratch");
+        assert_eq!(csr_name(0x777), "0x777");
+    }
+
+    #[test]
+    fn alu_decoder_previews_rv64m_operations() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(10, 6);
+        debugger.machine.cpu.set_register(13, 37);
+        debugger.machine.cpu.set_register(16, 222);
+
+        let mul = decode_alu(0x02a6_8833, &debugger).unwrap();
+        assert_eq!(mul.mnemonic, "mul");
+        assert_eq!(mul.rd, 16);
+        assert_eq!(mul.rs1, 13);
+        assert_eq!(mul.rhs, AluRhs::Register(10));
+        assert_eq!(mul.result, 222);
+
+        let divu = decode_alu(0x02d8_5633, &debugger).unwrap();
+        assert_eq!(divu.mnemonic, "divu");
+        assert_eq!(divu.rd, 12);
+        assert_eq!(divu.rs1, 16);
+        assert_eq!(divu.rhs, AluRhs::Register(13));
+        assert_eq!(divu.result, 6);
+    }
+
+    #[test]
+    fn alu_decoder_previews_rv64m_word_operations() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(15, 3);
+        debugger.machine.cpu.set_register(17, 300_000);
+
+        let divuw = decode_alu(0x02f8_d73b, &debugger).unwrap();
+        assert_eq!(divuw.mnemonic, "divuw");
+        assert_eq!(divuw.rd, 14);
+        assert_eq!(divuw.rs1, 17);
+        assert_eq!(divuw.rhs, AluRhs::Register(15));
+        assert_eq!(divuw.result, 100_000);
+
+        let subw = decode_alu(0x40f8_87bb, &debugger).unwrap();
+        assert_eq!(subw.mnemonic, "subw");
+        assert_eq!(subw.rd, 15);
+        assert_eq!(subw.rs1, 17);
+        assert_eq!(subw.rhs, AluRhs::Register(15));
+        assert_eq!(subw.result, 299_997);
     }
 
     #[test]

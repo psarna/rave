@@ -16,13 +16,36 @@ fn compiles_and_runs_a_uart_guest() {
     assert_eq!(result.uart_output, b"name?\noh hai Ada!\n");
 }
 
+#[test]
+fn compiles_and_runs_an_rv64m_guest() {
+    let result = compile_and_run_guest_with_march("rv64m", "rv64im", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"M");
+}
+
+#[test]
+fn compiles_and_runs_a_zicsr_guest() {
+    let result = compile_and_run_guest_with_march("zicsr", "rv64im_zicsr", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"C");
+}
+
 struct GuestResult {
     reason: HaltReason,
     uart_output: Vec<u8>,
 }
 
 fn compile_and_run_guest(name: &str, uart_input: &[u8], instruction_limit: u64) -> GuestResult {
-    let binary = compile_guest(name);
+    compile_and_run_guest_with_march(name, "rv64i", uart_input, instruction_limit)
+}
+
+fn compile_and_run_guest_with_march(
+    name: &str,
+    march: &str,
+    uart_input: &[u8],
+    instruction_limit: u64,
+) -> GuestResult {
+    let binary = compile_guest(name, march);
     let image = std::fs::read(binary).unwrap();
     let mut machine =
         Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
@@ -34,7 +57,7 @@ fn compile_and_run_guest(name: &str, uart_input: &[u8], instruction_limit: u64) 
     }
 }
 
-fn compile_guest(name: &str) -> PathBuf {
+fn compile_guest(name: &str, march: &str) -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = std::env::temp_dir().join(format!("rave-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
@@ -46,7 +69,7 @@ fn compile_guest(name: &str) -> PathBuf {
         Command::new("clang")
             .args([
                 "--target=riscv64-unknown-elf",
-                "-march=rv64i",
+                &format!("-march={march}"),
                 "-mabi=lp64",
                 "-mcmodel=medany",
                 "-ffreestanding",
@@ -58,7 +81,7 @@ fn compile_guest(name: &str) -> PathBuf {
             .arg(root.join(format!("tests/fixtures/{name}.c")))
             .arg("-o")
             .arg(&object),
-        "compile RV64I guest",
+        "compile RISC-V guest",
     );
 
     let linker = rust_lld();
@@ -69,7 +92,7 @@ fn compile_guest(name: &str) -> PathBuf {
             .arg(&object)
             .arg("-o")
             .arg(&elf),
-        "link RV64I guest",
+        "link RISC-V guest",
     );
 
     run(
