@@ -37,6 +37,7 @@ const OPCODE_OP_IMM: u32 = 0x13;
 const OPCODE_AUIPC: u32 = 0x17;
 const OPCODE_OP_IMM_32: u32 = 0x1b;
 const OPCODE_STORE: u32 = 0x23;
+const OPCODE_AMO: u32 = 0x2f;
 const OPCODE_OP: u32 = 0x33;
 const OPCODE_LUI: u32 = 0x37;
 const OPCODE_OP_32: u32 = 0x3b;
@@ -74,6 +75,9 @@ const FUNCT_STORE_HALF: u32 = 1;
 const FUNCT_STORE_WORD: u32 = 2;
 const FUNCT_STORE_DOUBLE: u32 = 3;
 
+const FUNCT_AMO_WORD: u32 = 2;
+const FUNCT_AMO_DOUBLE: u32 = 3;
+
 const FUNCT_SYSTEM_PRIVILEGED: u32 = 0;
 const FUNCT_CSRRW: u32 = 1;
 const FUNCT_CSRRS: u32 = 2;
@@ -85,6 +89,19 @@ const FUNCT_CSRRCI: u32 = 7;
 const FUNCT7_BASE: u32 = 0;
 const FUNCT7_MULTIPLY: u32 = 1;
 const FUNCT7_ALTERNATE: u32 = 0x20;
+const AMO_FUNCT_LOAD_RESERVED: u32 = 0b00010;
+const AMO_FUNCT_STORE_CONDITIONAL: u32 = 0b00011;
+const AMO_FUNCT_SWAP: u32 = 0b00001;
+const AMO_FUNCT_ADD: u32 = 0b00000;
+const AMO_FUNCT_XOR: u32 = 0b00100;
+const AMO_FUNCT_AND: u32 = 0b01100;
+const AMO_FUNCT_OR: u32 = 0b01000;
+const AMO_FUNCT_MIN: u32 = 0b10000;
+const AMO_FUNCT_MAX: u32 = 0b10100;
+const AMO_FUNCT_MIN_UNSIGNED: u32 = 0b11000;
+const AMO_FUNCT_MAX_UNSIGNED: u32 = 0b11100;
+const AMO_FUNCT_SHIFT: u32 = 27;
+const AMO_FUNCT_BITS: u32 = 5;
 const SHIFT64_LOGICAL_PREFIX: u32 = 0;
 const SHIFT64_ARITHMETIC_PREFIX: u32 = 0x10;
 const SHIFT64_MASK: u32 = 0x3f;
@@ -121,7 +138,7 @@ const MEPC_WRITABLE_MASK: u64 = !1;
 const MCAUSE_WRITABLE_MASK: u64 = u64::MAX;
 const MTVAL_WRITABLE_MASK: u64 = u64::MAX;
 const MSCRATCH_WRITABLE_MASK: u64 = u64::MAX;
-const MISA_VALUE: u64 = (2 << 62) | (1 << 8) | (1 << 12);
+const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 8) | (1 << 12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltReason {
@@ -159,6 +176,7 @@ impl From<BusError> for StepError {
 pub struct Cpu {
     registers: [u64; REGISTER_COUNT],
     csrs: CsrFile,
+    reservation: Option<u64>,
     pub pc: u64,
 }
 
@@ -211,6 +229,7 @@ impl Cpu {
         Self {
             registers: [0; REGISTER_COUNT],
             csrs: CsrFile::default(),
+            reservation: None,
             pc,
         }
     }
@@ -229,6 +248,10 @@ impl Cpu {
         self.csrs.read(address).unwrap_or(0)
     }
 
+    pub fn reservation_matches(&self, address: u64) -> bool {
+        self.reservation == Some(address)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<Option<HaltReason>, StepError> {
         let pc = self.pc;
         let instruction = Decoded::new(bus.read_u32(pc)?);
@@ -242,6 +265,7 @@ impl Cpu {
             OPCODE_BRANCH => self.execute_branch(instruction, pc, sequential_pc)?,
             OPCODE_LOAD => self.execute_load(instruction, bus, sequential_pc)?,
             OPCODE_STORE => self.execute_store(instruction, bus, sequential_pc)?,
+            OPCODE_AMO => self.execute_amo(instruction, bus, sequential_pc)?,
             OPCODE_OP_IMM => self.execute_op_immediate(instruction, sequential_pc)?,
             OPCODE_OP_IMM_32 => self.execute_op_immediate_word(instruction, sequential_pc)?,
             OPCODE_OP => self.execute_op(instruction, sequential_pc)?,
@@ -359,7 +383,118 @@ impl Cpu {
             FUNCT_STORE_DOUBLE => bus.write_u64(address, value)?,
             _ => return Err(illegal(self.pc, instruction.raw)),
         }
+        self.clear_reservation_for_store(address);
         Ok(Execution::Continue { next_pc })
+    }
+
+    fn execute_amo(
+        &mut self,
+        instruction: Decoded,
+        bus: &mut Bus,
+        next_pc: u64,
+    ) -> Result<Execution, StepError> {
+        let address = self.registers[instruction.rs1];
+        let funct5 = bits(instruction.raw, AMO_FUNCT_SHIFT, AMO_FUNCT_BITS);
+        match instruction.funct3 {
+            FUNCT_AMO_WORD => self.execute_amo_word(instruction, bus, address, funct5)?,
+            FUNCT_AMO_DOUBLE => self.execute_amo_double(instruction, bus, address, funct5)?,
+            _ => return Err(illegal(self.pc, instruction.raw)),
+        }
+        Ok(Execution::Continue { next_pc })
+    }
+
+    fn execute_amo_word(
+        &mut self,
+        instruction: Decoded,
+        bus: &mut Bus,
+        address: u64,
+        funct5: u32,
+    ) -> Result<(), StepError> {
+        if funct5 == AMO_FUNCT_LOAD_RESERVED {
+            if instruction.rs2 != ZERO_REGISTER {
+                return Err(illegal(self.pc, instruction.raw));
+            }
+            let old = bus.read_u32(address)?;
+            self.reservation = Some(address);
+            self.set_register(instruction.rd, sign_extend_word(old));
+            return Ok(());
+        }
+
+        if funct5 == AMO_FUNCT_STORE_CONDITIONAL {
+            let success = self.reservation == Some(address);
+            self.reservation = None;
+            if success {
+                bus.write_u32(address, self.registers[instruction.rs2] as u32)?;
+            }
+            self.set_register(instruction.rd, (!success) as u64);
+            return Ok(());
+        }
+
+        let old = bus.read_u32(address)?;
+        let rhs = self.registers[instruction.rs2] as u32;
+        let new = match funct5 {
+            AMO_FUNCT_SWAP => rhs,
+            AMO_FUNCT_ADD => old.wrapping_add(rhs),
+            AMO_FUNCT_XOR => old ^ rhs,
+            AMO_FUNCT_AND => old & rhs,
+            AMO_FUNCT_OR => old | rhs,
+            AMO_FUNCT_MIN => ((old as i32).min(rhs as i32)) as u32,
+            AMO_FUNCT_MAX => ((old as i32).max(rhs as i32)) as u32,
+            AMO_FUNCT_MIN_UNSIGNED => old.min(rhs),
+            AMO_FUNCT_MAX_UNSIGNED => old.max(rhs),
+            _ => return Err(illegal(self.pc, instruction.raw)),
+        };
+        bus.write_u32(address, new)?;
+        self.clear_reservation_for_store(address);
+        self.set_register(instruction.rd, sign_extend_word(old));
+        Ok(())
+    }
+
+    fn execute_amo_double(
+        &mut self,
+        instruction: Decoded,
+        bus: &mut Bus,
+        address: u64,
+        funct5: u32,
+    ) -> Result<(), StepError> {
+        if funct5 == AMO_FUNCT_LOAD_RESERVED {
+            if instruction.rs2 != ZERO_REGISTER {
+                return Err(illegal(self.pc, instruction.raw));
+            }
+            let old = bus.read_u64(address)?;
+            self.reservation = Some(address);
+            self.set_register(instruction.rd, old);
+            return Ok(());
+        }
+
+        if funct5 == AMO_FUNCT_STORE_CONDITIONAL {
+            let success = self.reservation == Some(address);
+            self.reservation = None;
+            if success {
+                bus.write_u64(address, self.registers[instruction.rs2])?;
+            }
+            self.set_register(instruction.rd, (!success) as u64);
+            return Ok(());
+        }
+
+        let old = bus.read_u64(address)?;
+        let rhs = self.registers[instruction.rs2];
+        let new = match funct5 {
+            AMO_FUNCT_SWAP => rhs,
+            AMO_FUNCT_ADD => old.wrapping_add(rhs),
+            AMO_FUNCT_XOR => old ^ rhs,
+            AMO_FUNCT_AND => old & rhs,
+            AMO_FUNCT_OR => old | rhs,
+            AMO_FUNCT_MIN => ((old as i64).min(rhs as i64)) as u64,
+            AMO_FUNCT_MAX => ((old as i64).max(rhs as i64)) as u64,
+            AMO_FUNCT_MIN_UNSIGNED => old.min(rhs),
+            AMO_FUNCT_MAX_UNSIGNED => old.max(rhs),
+            _ => return Err(illegal(self.pc, instruction.raw)),
+        };
+        bus.write_u64(address, new)?;
+        self.clear_reservation_for_store(address);
+        self.set_register(instruction.rd, old);
+        Ok(())
     }
 
     fn execute_op_immediate(
@@ -536,6 +671,12 @@ impl Cpu {
 
     fn effective_i_address(&self, instruction: Decoded) -> u64 {
         self.registers[instruction.rs1].wrapping_add(i_immediate(instruction.raw) as u64)
+    }
+
+    fn clear_reservation_for_store(&mut self, address: u64) {
+        if self.reservation == Some(address) {
+            self.reservation = None;
+        }
     }
 }
 
@@ -939,6 +1080,121 @@ mod tests {
     }
 
     #[test]
+    fn rv64a_atomic_memory_operations_return_old_values_and_store_new_values() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(64);
+        let word_address = DRAM_START + 40;
+        let double_address = DRAM_START + 48;
+        cpu.set_register(1, word_address);
+        cpu.set_register(2, 5);
+        cpu.set_register(3, double_address);
+        cpu.set_register(4, 7);
+        bus.write_u32(word_address, 0xffff_fffe).unwrap();
+        bus.write_u64(double_address, 10).unwrap();
+        bus.write_u32(
+            DRAM_START,
+            encode_amo(AMO_FUNCT_ADD, 2, 1, FUNCT_AMO_WORD, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_amo(AMO_FUNCT_MAX_UNSIGNED, 4, 3, FUNCT_AMO_DOUBLE, 6),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 0xffff_ffff_ffff_fffe);
+        assert_eq!(bus.read_u32(word_address).unwrap(), 3);
+        assert_eq!(cpu.register(6), 10);
+        assert_eq!(bus.read_u64(double_address).unwrap(), 10);
+    }
+
+    #[test]
+    fn rv64a_load_reserved_and_store_conditional_report_success_or_failure() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(64);
+        let address = DRAM_START + 40;
+        cpu.set_register(1, address);
+        cpu.set_register(2, 0x55aa);
+        bus.write_u64(address, 0x1234).unwrap();
+        bus.write_u32(
+            DRAM_START,
+            encode_amo(AMO_FUNCT_LOAD_RESERVED, 0, 1, FUNCT_AMO_DOUBLE, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_amo(AMO_FUNCT_STORE_CONDITIONAL, 2, 1, FUNCT_AMO_DOUBLE, 6),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_amo(AMO_FUNCT_STORE_CONDITIONAL, 2, 1, FUNCT_AMO_DOUBLE, 7),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 0x1234);
+        assert_eq!(cpu.register(6), 0);
+        assert_eq!(cpu.register(7), 1);
+        assert_eq!(bus.read_u64(address).unwrap(), 0x55aa);
+    }
+
+    #[test]
+    fn rv64a_store_to_reserved_address_makes_store_conditional_fail() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(64);
+        let address = DRAM_START + 40;
+        cpu.set_register(1, address);
+        cpu.set_register(2, 0x1234);
+        cpu.set_register(3, 0x5678);
+        bus.write_u64(address, 0).unwrap();
+        bus.write_u32(
+            DRAM_START,
+            encode_amo(AMO_FUNCT_LOAD_RESERVED, 0, 1, FUNCT_AMO_DOUBLE, 5),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_s(0, 2, 1, FUNCT_STORE_DOUBLE),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_amo(AMO_FUNCT_STORE_CONDITIONAL, 3, 1, FUNCT_AMO_DOUBLE, 6),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(6), 1);
+        assert_eq!(bus.read_u64(address).unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn rv64a_lr_requires_zero_rs2() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        let instruction = encode_amo(AMO_FUNCT_LOAD_RESERVED, 1, 0, FUNCT_AMO_WORD, 5);
+        bus.write_u32(DRAM_START, instruction).unwrap();
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(StepError::IllegalInstruction {
+                pc: DRAM_START,
+                instruction,
+            })
+        );
+    }
+
+    #[test]
     fn csrrw_swaps_register_and_machine_csr_values() {
         let mut cpu = Cpu::new(DRAM_START);
         let mut bus = Bus::new(16);
@@ -1182,6 +1438,24 @@ mod tests {
             | (funct3 << FUNCT3_SHIFT)
             | (rd << RD_SHIFT)
             | OPCODE_OP_32
+    }
+
+    fn encode_s(immediate: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+        (((immediate >> 5) & 0x7f) << S_IMMEDIATE_HIGH_SHIFT)
+            | (rs2 << RS2_SHIFT)
+            | (rs1 << RS1_SHIFT)
+            | (funct3 << FUNCT3_SHIFT)
+            | ((immediate & 0x1f) << S_IMMEDIATE_LOW_SHIFT)
+            | OPCODE_STORE
+    }
+
+    fn encode_amo(funct5: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct5 << AMO_FUNCT_SHIFT)
+            | (rs2 << RS2_SHIFT)
+            | (rs1 << RS1_SHIFT)
+            | (funct3 << FUNCT3_SHIFT)
+            | (rd << RD_SHIFT)
+            | OPCODE_AMO
     }
 
     fn encode_csr(csr: u32, funct3: u32, rs1: u32, rd: u32) -> u32 {

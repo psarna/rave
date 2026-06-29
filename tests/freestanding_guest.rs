@@ -24,6 +24,13 @@ fn compiles_and_runs_an_rv64m_guest() {
 }
 
 #[test]
+fn compiles_and_runs_an_rv64a_guest() {
+    let result = compile_and_run_guest_with_march("rv64a", "rv64ima", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"A");
+}
+
+#[test]
 fn compiles_and_runs_a_zicsr_guest() {
     let result = compile_and_run_guest_with_march("zicsr", "rv64im_zicsr", b"", 100_000);
     assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });

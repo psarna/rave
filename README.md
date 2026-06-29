@@ -2,11 +2,12 @@
 
 ![logo](demo/rave.png)
 
-A minimal RV64IM_Zicsr_Zifencei (more letters coming!) emulator
+A minimal RV64IMA_Zicsr_Zifencei (more letters coming!) emulator
 
 - 32 integer registers and an explicit program counter
 - base RV64I integer, branch, jump, and load/store instructions
 - RV64M integer multiply, divide, and remainder instructions
+- RV64A atomic memory operations and LR/SC reservations
 - Zicsr CSR read/write, set, and clear instructions
 - Zifencei instruction-fetch fence as a validated no-op
 - RV64 word operations with 32-bit sign extension

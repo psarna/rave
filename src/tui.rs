@@ -86,6 +86,25 @@ enum CsrOperand {
     Immediate(u64),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmoInfo {
+    mnemonic: &'static str,
+    rd: usize,
+    rs1: usize,
+    rs2: usize,
+    address: u64,
+    width: AmoWidth,
+    old_value: Option<u64>,
+    new_value: Option<u64>,
+    sc_success: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmoWidth {
+    Word,
+    Double,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitChord {
     ControlC,
@@ -548,6 +567,8 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                                     base.patch(Style::default().fg(Color::Cyan)),
                                 ),
                             ]);
+                        } else if let Some(amo) = decode_amo(instruction, debugger) {
+                            spans.extend(amo_spans(&amo, base));
                         }
                         // Decode ALU ops
                         else if let Some(alu) = decode_alu(instruction, debugger) {
@@ -848,6 +869,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x17 => "auipc",
         0x1b => "op-imm-32",
         0x23 => "store",
+        0x2f => "amo",
         0x33 => "op",
         0x37 => "lui",
         0x3b => "op-32",
@@ -1040,6 +1062,186 @@ fn decode_mem(instruction: u32, debugger: &Debugger) -> Option<MemInfo> {
         offset,
         address: addr,
     })
+}
+
+fn decode_amo(instruction: u32, debugger: &Debugger) -> Option<AmoInfo> {
+    if instruction & 0x7f != 0x2f {
+        return None;
+    }
+    let rd = ((instruction >> 7) & 0x1f) as usize;
+    let funct3 = (instruction >> 12) & 0x7;
+    let rs1 = ((instruction >> 15) & 0x1f) as usize;
+    let rs2 = ((instruction >> 20) & 0x1f) as usize;
+    let funct5 = (instruction >> 27) & 0x1f;
+    let width = match funct3 {
+        2 => AmoWidth::Word,
+        3 => AmoWidth::Double,
+        _ => return None,
+    };
+    let suffix = match width {
+        AmoWidth::Word => "w",
+        AmoWidth::Double => "d",
+    };
+    let operation = match funct5 {
+        0b00010 if rs2 == 0 => "lr",
+        0b00011 => "sc",
+        0b00001 => "amoswap",
+        0b00000 => "amoadd",
+        0b00100 => "amoxor",
+        0b01100 => "amoand",
+        0b01000 => "amoor",
+        0b10000 => "amomin",
+        0b10100 => "amomax",
+        0b11000 => "amominu",
+        0b11100 => "amomaxu",
+        _ => return None,
+    };
+    let mnemonic = amo_mnemonic(operation, suffix)?;
+    let address = debugger.machine.cpu.register(rs1);
+    let old_value = match width {
+        AmoWidth::Word => debugger
+            .machine
+            .bus
+            .read_u32(address)
+            .ok()
+            .map(sign_extend_word),
+        AmoWidth::Double => debugger.machine.bus.read_u64(address).ok(),
+    };
+    let rhs = debugger.machine.cpu.register(rs2);
+    let sc_success = (operation == "sc").then(|| debugger.machine.cpu.reservation_matches(address));
+    let new_value = match operation {
+        "lr" => None,
+        "sc" => sc_success.and_then(|success| success.then_some(width_value(width, rhs))),
+        _ => old_value.map(|old| amo_new_value(operation, width, old, rhs)),
+    };
+
+    Some(AmoInfo {
+        mnemonic,
+        rd,
+        rs1,
+        rs2,
+        address,
+        width,
+        old_value,
+        new_value,
+        sc_success,
+    })
+}
+
+fn amo_mnemonic(operation: &str, suffix: &str) -> Option<&'static str> {
+    match (operation, suffix) {
+        ("lr", "w") => Some("lr.w"),
+        ("lr", "d") => Some("lr.d"),
+        ("sc", "w") => Some("sc.w"),
+        ("sc", "d") => Some("sc.d"),
+        ("amoswap", "w") => Some("amoswap.w"),
+        ("amoswap", "d") => Some("amoswap.d"),
+        ("amoadd", "w") => Some("amoadd.w"),
+        ("amoadd", "d") => Some("amoadd.d"),
+        ("amoxor", "w") => Some("amoxor.w"),
+        ("amoxor", "d") => Some("amoxor.d"),
+        ("amoand", "w") => Some("amoand.w"),
+        ("amoand", "d") => Some("amoand.d"),
+        ("amoor", "w") => Some("amoor.w"),
+        ("amoor", "d") => Some("amoor.d"),
+        ("amomin", "w") => Some("amomin.w"),
+        ("amomin", "d") => Some("amomin.d"),
+        ("amomax", "w") => Some("amomax.w"),
+        ("amomax", "d") => Some("amomax.d"),
+        ("amominu", "w") => Some("amominu.w"),
+        ("amominu", "d") => Some("amominu.d"),
+        ("amomaxu", "w") => Some("amomaxu.w"),
+        ("amomaxu", "d") => Some("amomaxu.d"),
+        _ => None,
+    }
+}
+
+fn width_value(width: AmoWidth, value: u64) -> u64 {
+    match width {
+        AmoWidth::Word => sign_extend_word(value as u32),
+        AmoWidth::Double => value,
+    }
+}
+
+fn amo_new_value(operation: &str, width: AmoWidth, old: u64, rhs: u64) -> u64 {
+    match width {
+        AmoWidth::Word => {
+            let lhs = old as u32;
+            let rhs = rhs as u32;
+            let value = match operation {
+                "amoswap" => rhs,
+                "amoadd" => lhs.wrapping_add(rhs),
+                "amoxor" => lhs ^ rhs,
+                "amoand" => lhs & rhs,
+                "amoor" => lhs | rhs,
+                "amomin" => ((lhs as i32).min(rhs as i32)) as u32,
+                "amomax" => ((lhs as i32).max(rhs as i32)) as u32,
+                "amominu" => lhs.min(rhs),
+                "amomaxu" => lhs.max(rhs),
+                _ => lhs,
+            };
+            sign_extend_word(value)
+        }
+        AmoWidth::Double => match operation {
+            "amoswap" => rhs,
+            "amoadd" => old.wrapping_add(rhs),
+            "amoxor" => old ^ rhs,
+            "amoand" => old & rhs,
+            "amoor" => old | rhs,
+            "amomin" => ((old as i64).min(rhs as i64)) as u64,
+            "amomax" => ((old as i64).max(rhs as i64)) as u64,
+            "amominu" => old.min(rhs),
+            "amomaxu" => old.max(rhs),
+            _ => old,
+        },
+    }
+}
+
+fn amo_spans<'a>(amo: &AmoInfo, base: Style) -> Vec<Span<'a>> {
+    let rd_name = REGISTER_NAMES[amo.rd];
+    let rs2_name = REGISTER_NAMES[amo.rs2];
+    let rs1_name = REGISTER_NAMES[amo.rs1];
+    let mut spans = vec![Span::styled(
+        if amo.mnemonic.starts_with("lr.") {
+            format!("{} {},({}) @ ", amo.mnemonic, rd_name, rs1_name)
+        } else {
+            format!(
+                "{} {},{},({}) @ ",
+                amo.mnemonic, rd_name, rs2_name, rs1_name
+            )
+        },
+        base,
+    )];
+    spans.push(Span::styled(
+        format!("{:#018x}", amo.address),
+        base.patch(Style::default().fg(Color::Cyan)),
+    ));
+    if let Some(old_value) = amo.old_value {
+        spans.push(Span::styled(" [old ", base));
+        spans.push(Span::styled(
+            format!("{old_value:#x}"),
+            base.patch(Style::default().fg(Color::Yellow)),
+        ));
+        if let Some(new_value) = amo.new_value {
+            spans.push(Span::styled(" -> ", base));
+            spans.push(Span::styled(
+                format!("{new_value:#x}"),
+                base.patch(Style::default().fg(Color::Cyan)),
+            ));
+        }
+        spans.push(Span::styled("]", base));
+    }
+    if let Some(success) = amo.sc_success {
+        spans.push(Span::styled(
+            if success { " success" } else { " fail" },
+            base.patch(Style::default().fg(if success {
+                Color::LightGreen
+            } else {
+                Color::LightRed
+            })),
+        ));
+    }
+    spans
 }
 
 fn csr_name(address: u16) -> String {
@@ -1350,6 +1552,10 @@ mod tests {
         (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
     }
 
+    fn amo_type(funct5: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct5 << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
+    }
+
     fn debugger() -> Debugger {
         Debugger::new(&0x0010_0073_u32.to_le_bytes(), Machine::LOAD_ADDRESS, 4096).unwrap()
     }
@@ -1515,6 +1721,62 @@ mod tests {
         assert_eq!(decoded.register, 10);
         assert_eq!(decoded.offset, -8);
         assert_eq!(decoded.address, 0x8000_0ff8);
+    }
+
+    #[test]
+    fn amo_decoder_previews_atomic_memory_operations() {
+        let mut debugger = debugger();
+        debugger
+            .machine
+            .cpu
+            .set_register(1, Machine::LOAD_ADDRESS + 64);
+        debugger.machine.cpu.set_register(2, 5);
+        debugger
+            .machine
+            .bus
+            .write_u64(Machine::LOAD_ADDRESS + 64, 10)
+            .unwrap();
+        let amoadd = amo_type(0b00000, 2, 1, 3, 5);
+        let decoded = decode_amo(amoadd, &debugger).unwrap();
+
+        assert_eq!(decoded.mnemonic, "amoadd.d");
+        assert_eq!(decoded.rd, 5);
+        assert_eq!(decoded.rs2, 2);
+        assert_eq!(decoded.address, Machine::LOAD_ADDRESS + 64);
+        assert_eq!(decoded.old_value, Some(10));
+        assert_eq!(decoded.new_value, Some(15));
+    }
+
+    #[test]
+    fn amo_decoder_previews_lr_sc_reservation_status() {
+        let mut debugger = debugger();
+        debugger
+            .machine
+            .cpu
+            .set_register(1, Machine::LOAD_ADDRESS + 64);
+        debugger.machine.cpu.set_register(2, 0x99);
+        debugger
+            .machine
+            .bus
+            .write_u32(Machine::LOAD_ADDRESS + 64, 0x8000_0000)
+            .unwrap();
+
+        let lr = amo_type(0b00010, 0, 1, 2, 5);
+        let sc = amo_type(0b00011, 2, 1, 2, 6);
+        debugger
+            .machine
+            .bus
+            .write_u32(Machine::LOAD_ADDRESS, lr)
+            .unwrap();
+        assert_eq!(decode_amo(lr, &debugger).unwrap().mnemonic, "lr.w");
+        assert_eq!(decode_amo(sc, &debugger).unwrap().sc_success, Some(false));
+
+        debugger.machine.step().unwrap();
+        let decoded = decode_amo(sc, &debugger).unwrap();
+        assert_eq!(decoded.mnemonic, "sc.w");
+        assert_eq!(decoded.sc_success, Some(true));
+        assert_eq!(decoded.old_value, Some(0xffff_ffff_8000_0000));
+        assert_eq!(decoded.new_value, Some(0x99));
     }
 
     #[test]
