@@ -9,7 +9,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
-use rave::{Command, Debugger, Machine, StopReason, REGISTER_NAMES};
+use rave::{
+    decode_compressed_instruction, encoded_instruction_size, Command, Debugger, Machine,
+    StopReason, REGISTER_NAMES,
+};
 use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
@@ -442,17 +445,17 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
     let pc = debugger.machine.cpu.pc;
     let code_rows = visible_code_rows(area);
     let rows_before_pc = code_rows / 2;
-    let first = pc.saturating_sub(INSTRUCTION_SIZE * rows_before_pc);
-    let last = first.wrapping_add(code_rows.saturating_sub(1) * INSTRUCTION_SIZE);
-    let current_branch = debugger
-        .machine
-        .bus
-        .read_u32(pc)
+    let first = pc
+        .saturating_sub(INSTRUCTION_SIZE * rows_before_pc)
+        .wrapping_add(pc & 1);
+    let addresses = code_addresses(first, code_rows, debugger);
+    let last = addresses.last().copied().unwrap_or(first);
+    let current_branch = read_display_instruction(pc, debugger)
         .ok()
-        .and_then(|instruction| branch_info(instruction, pc, debugger));
-    let lines: Vec<Line<'_>> = (0..code_rows)
-        .map(|index| {
-            let address = first.wrapping_add(index * INSTRUCTION_SIZE);
+        .and_then(|instruction| branch_info(instruction.expanded, pc, debugger));
+    let lines: Vec<Line<'_>> = addresses
+        .into_iter()
+        .map(|address| {
             let current = address == pc;
             let breakpoint = debugger.breakpoints().contains(&address);
             let arrow = current_branch
@@ -492,25 +495,25 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                 ),
                 Span::styled("  ", base),
             ];
-            match debugger.machine.bus.read_u32(address) {
-                Ok(instruction) => {
+            match read_display_instruction(address, debugger) {
+                Ok(display) => {
                     spans.push(Span::styled(
-                        format!("{instruction:08x}"),
+                        display.encoding.clone(),
                         base.patch(Style::default().fg(Color::Magenta)),
                     ));
                     spans.push(Span::styled("  ", base));
                     spans.push(Span::styled(
                         format!(
                             "{:<width$}",
-                            instruction_name(instruction),
+                            display.name(),
                             width = INSTRUCTION_CLASS_WIDTH
                         ),
                         base.patch(Style::default().fg(Color::Green)),
                     ));
+                    let instruction = display.expanded;
                     if let Some(branch) = branch_info(instruction, address, debugger) {
                         spans.extend(branch_spans(&branch, base, debugger));
                     } else {
-                        // Decode jumps
                         if let Some(jump) = decode_jump(instruction, address, debugger) {
                             let rd_name = if jump.rd == 0 {
                                 "zero"
@@ -537,9 +540,7 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                                     base.patch(Style::default().fg(Color::Cyan)),
                                 ),
                             ]);
-                        }
-                        // Decode memory ops
-                        else if let Some(mem) = decode_mem(instruction, debugger) {
+                        } else if let Some(mem) = decode_mem(instruction, debugger) {
                             let register_name = if mem.register == 0 {
                                 "zero"
                             } else {
@@ -569,9 +570,7 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                             ]);
                         } else if let Some(amo) = decode_amo(instruction, debugger) {
                             spans.extend(amo_spans(&amo, base));
-                        }
-                        // Decode ALU ops
-                        else if let Some(alu) = decode_alu(instruction, debugger) {
+                        } else if let Some(alu) = decode_alu(instruction, debugger) {
                             let rd_name = if alu.rd == 0 {
                                 "zero"
                             } else {
@@ -667,6 +666,57 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
         ),
         area,
     );
+}
+
+struct DisplayInstruction {
+    expanded: u32,
+    encoding: String,
+    compressed: Option<u16>,
+}
+
+impl DisplayInstruction {
+    fn name(&self) -> &'static str {
+        self.compressed
+            .map(compressed_instruction_name)
+            .unwrap_or_else(|| instruction_name(self.expanded))
+    }
+}
+
+fn code_addresses(first: u64, rows: u64, debugger: &Debugger) -> Vec<u64> {
+    let mut addresses = Vec::with_capacity(rows as usize);
+    let mut address = first & !1;
+    for _ in 0..rows {
+        addresses.push(address);
+        let size = debugger
+            .machine
+            .bus
+            .read_u16(address)
+            .map(encoded_instruction_size)
+            .unwrap_or(INSTRUCTION_SIZE);
+        address = address.wrapping_add(size);
+    }
+    addresses
+}
+
+fn read_display_instruction(
+    address: u64,
+    debugger: &Debugger,
+) -> Result<DisplayInstruction, rave::BusError> {
+    let half = debugger.machine.bus.read_u16(address)?;
+    if encoded_instruction_size(half) == INSTRUCTION_SIZE {
+        let expanded = debugger.machine.bus.read_u32(address)?;
+        Ok(DisplayInstruction {
+            expanded,
+            encoding: format!("{expanded:08x}"),
+            compressed: None,
+        })
+    } else {
+        Ok(DisplayInstruction {
+            expanded: decode_compressed_instruction(half).unwrap_or(u32::from(half)),
+            encoding: format!("    {half:04x}"),
+            compressed: Some(half),
+        })
+    }
 }
 
 fn visible_code_rows(area: Rect) -> u64 {
@@ -880,6 +930,64 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x73 if instruction == 0x0000_0073 => "ecall",
         0x73 => "system",
         _ => "unknown",
+    }
+}
+
+fn compressed_instruction_name(instruction: u16) -> &'static str {
+    let raw = u32::from(instruction);
+    let quadrant = raw & 0b11;
+    let funct3 = (raw >> 13) & 0b111;
+    match (quadrant, funct3) {
+        (0b00, 0b000) => "c.addi4spn",
+        (0b00, 0b010) => "c.lw",
+        (0b00, 0b011) => "c.ld",
+        (0b00, 0b110) => "c.sw",
+        (0b00, 0b111) => "c.sd",
+        (0b01, 0b000) if raw == 0x0001 => "c.nop",
+        (0b01, 0b000) => "c.addi",
+        (0b01, 0b001) => "c.addiw",
+        (0b01, 0b010) => "c.li",
+        (0b01, 0b011) if ((raw >> 7) & 0x1f) == 2 => "c.addi16sp",
+        (0b01, 0b011) => "c.lui",
+        (0b01, 0b100) => compressed_misc_alu_name(raw),
+        (0b01, 0b101) => "c.j",
+        (0b01, 0b110) => "c.beqz",
+        (0b01, 0b111) => "c.bnez",
+        (0b10, 0b000) => "c.slli",
+        (0b10, 0b010) => "c.lwsp",
+        (0b10, 0b011) => "c.ldsp",
+        (0b10, 0b100) => compressed_jalr_mv_name(raw),
+        (0b10, 0b110) => "c.swsp",
+        (0b10, 0b111) => "c.sdsp",
+        _ => "c.unknown",
+    }
+}
+
+fn compressed_misc_alu_name(raw: u32) -> &'static str {
+    match ((raw >> 10) & 0b11, (raw >> 12) & 1, (raw >> 5) & 0b11) {
+        (0b00, _, _) => "c.srli",
+        (0b01, _, _) => "c.srai",
+        (0b10, _, _) => "c.andi",
+        (0b11, 0, 0b00) => "c.sub",
+        (0b11, 0, 0b01) => "c.xor",
+        (0b11, 0, 0b10) => "c.or",
+        (0b11, 0, 0b11) => "c.and",
+        (0b11, 1, 0b00) => "c.subw",
+        (0b11, 1, 0b01) => "c.addw",
+        _ => "c.unknown",
+    }
+}
+
+fn compressed_jalr_mv_name(raw: u32) -> &'static str {
+    let rd_rs1 = (raw >> 7) & 0x1f;
+    let rs2 = (raw >> 2) & 0x1f;
+    match ((raw >> 12) & 1, rd_rs1, rs2) {
+        (0, _, 0) => "c.jr",
+        (0, _, _) => "c.mv",
+        (1, 0, 0) => "c.ebreak",
+        (1, _, 0) => "c.jalr",
+        (1, _, _) => "c.add",
+        _ => "c.unknown",
     }
 }
 
@@ -1623,6 +1731,17 @@ mod tests {
         assert_eq!(debugger.machine.cpu.pc, Machine::LOAD_ADDRESS + 4);
         assert_eq!(debugger.machine.cpu.register(1), 1);
         assert_eq!(app.last_command.as_deref(), Some("step"));
+    }
+
+    #[test]
+    fn compressed_instruction_names_show_original_encoding() {
+        assert_eq!(compressed_instruction_name(0x4085), "c.li");
+        assert_eq!(compressed_instruction_name(0x9002), "c.ebreak");
+        assert_eq!(compressed_instruction_name(0xc011), "c.beqz");
+        assert_eq!(compressed_instruction_name(0x6105), "c.addi16sp");
+        assert_eq!(compressed_instruction_name(0x9005), "c.srli");
+        assert_eq!(compressed_instruction_name(0x8405), "c.srai");
+        assert_eq!(compressed_instruction_name(0x987d), "c.andi");
     }
 
     #[test]

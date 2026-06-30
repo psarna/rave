@@ -2,15 +2,17 @@
 
 ![logo](demo/rave.png)
 
-A minimal RV64IMA_Zicsr_Zifencei (more letters coming!) emulator
+A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 
 - 32 integer registers and an explicit program counter
 - base RV64I integer, branch, jump, and load/store instructions
 - RV64M integer multiply, divide, and remainder instructions
 - RV64A atomic memory operations and LR/SC reservations
+- RV64C compressed integer, control-flow, and load/store instructions
 - Zicsr CSR read/write, set, and clear instructions
 - Zifencei instruction-fetch fence as a validated no-op
 - RV64 word operations with 32-bit sign extension
+- mixed 16-bit and 32-bit instruction fetch
 - raw binaries loaded into DRAM at `0x8000_0000`
 - `ebreak` as a temporary host exit boundary; register `a0` is the result code
 - polled 16550-style UART input and output at `0x1000_0000`
@@ -52,10 +54,15 @@ target. See `demo/` for a few precompiled ones. Run with e.g.
 cargo run -- --interactive demo/uart.bin
 ```
 
+Compressed-instruction demo:
+
+```sh
+cargo run -- demo/rv64c.bin
+```
+
 Auto tests:
 ```sh
 cargo test
 ```
 
-Compressed instructions, privileged modes, virtual memory,
-interrupts, and functional devices are intentionally not here yet. They will come.
+Privileged modes, virtual memory, interrupts, and functional devices are intentionally not here yet. They will come.

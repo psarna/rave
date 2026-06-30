@@ -37,6 +37,13 @@ fn compiles_and_runs_a_zicsr_guest() {
     assert_eq!(result.uart_output, b"C");
 }
 
+#[test]
+fn compiles_and_runs_an_rv64c_guest() {
+    let result = compile_and_run_guest_with_march("rv64c", "rv64imac", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"C");
+}
+
 struct GuestResult {
     reason: HaltReason,
     uart_output: Vec<u8>,

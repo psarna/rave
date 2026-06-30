@@ -4,6 +4,7 @@ use std::fmt;
 const REGISTER_COUNT: usize = 32;
 const ZERO_REGISTER: usize = 0;
 const RETURN_VALUE_REGISTER: usize = 10;
+const COMPRESSED_INSTRUCTION_SIZE: u64 = 2;
 const INSTRUCTION_SIZE: u64 = 4;
 const INSTRUCTION_BITS: u32 = 32;
 const XLEN_BITS: u32 = 64;
@@ -138,7 +139,7 @@ const MEPC_WRITABLE_MASK: u64 = !1;
 const MCAUSE_WRITABLE_MASK: u64 = u64::MAX;
 const MTVAL_WRITABLE_MASK: u64 = u64::MAX;
 const MSCRATCH_WRITABLE_MASK: u64 = u64::MAX;
-const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 8) | (1 << 12);
+const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltReason {
@@ -219,6 +220,12 @@ impl Decoded {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Fetched {
+    raw: u32,
+    size: u64,
+}
+
 enum Execution {
     Continue { next_pc: u64 },
     Halt(HaltReason),
@@ -254,8 +261,9 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<Option<HaltReason>, StepError> {
         let pc = self.pc;
-        let instruction = Decoded::new(bus.read_u32(pc)?);
-        let sequential_pc = pc.wrapping_add(INSTRUCTION_SIZE);
+        let fetched = fetch_instruction(bus, pc)?;
+        let instruction = Decoded::new(fetched.raw);
+        let sequential_pc = pc.wrapping_add(fetched.size);
 
         let execution = match instruction.opcode {
             OPCODE_LUI => self.execute_lui(instruction, sequential_pc),
@@ -271,7 +279,7 @@ impl Cpu {
             OPCODE_OP => self.execute_op(instruction, sequential_pc)?,
             OPCODE_OP_32 => self.execute_op_word(instruction, sequential_pc)?,
             OPCODE_MISC_MEM => self.execute_misc_mem(instruction, sequential_pc)?,
-            OPCODE_SYSTEM => self.execute_system(instruction, pc)?,
+            OPCODE_SYSTEM => self.execute_system(instruction, pc, sequential_pc)?,
             _ => return Err(illegal(pc, instruction.raw)),
         };
 
@@ -613,18 +621,28 @@ impl Cpu {
         }
     }
 
-    fn execute_system(&mut self, instruction: Decoded, pc: u64) -> Result<Execution, StepError> {
+    fn execute_system(
+        &mut self,
+        instruction: Decoded,
+        pc: u64,
+        next_pc: u64,
+    ) -> Result<Execution, StepError> {
         match instruction.raw {
             INSTRUCTION_EBREAK => Ok(Execution::Halt(HaltReason::Breakpoint {
                 code: self.registers[RETURN_VALUE_REGISTER],
             })),
             INSTRUCTION_ECALL => Err(StepError::EnvironmentCall { pc }),
             _ if instruction.funct3 == FUNCT_SYSTEM_PRIVILEGED => Err(illegal(pc, instruction.raw)),
-            _ => self.execute_csr(instruction, pc),
+            _ => self.execute_csr(instruction, pc, next_pc),
         }
     }
 
-    fn execute_csr(&mut self, instruction: Decoded, pc: u64) -> Result<Execution, StepError> {
+    fn execute_csr(
+        &mut self,
+        instruction: Decoded,
+        pc: u64,
+        next_pc: u64,
+    ) -> Result<Execution, StepError> {
         let address = csr_address(instruction.raw);
         let old_value = self
             .csrs
@@ -664,9 +682,7 @@ impl Cpu {
                 .ok_or_else(|| illegal(pc, instruction.raw))?;
         }
         self.set_register(instruction.rd, old_value);
-        Ok(Execution::Continue {
-            next_pc: pc.wrapping_add(INSTRUCTION_SIZE),
-        })
+        Ok(Execution::Continue { next_pc })
     }
 
     fn effective_i_address(&self, instruction: Decoded) -> u64 {
@@ -678,6 +694,416 @@ impl Cpu {
             self.reservation = None;
         }
     }
+}
+
+fn fetch_instruction(bus: &Bus, pc: u64) -> Result<Fetched, StepError> {
+    let half = bus.read_u16(pc)?;
+    if half & 0b11 == 0b11 {
+        Ok(Fetched {
+            raw: bus.read_u32(pc)?,
+            size: INSTRUCTION_SIZE,
+        })
+    } else {
+        let raw = decompress(half)
+            .map_err(|instruction| StepError::IllegalInstruction { pc, instruction })?;
+        Ok(Fetched {
+            raw,
+            size: COMPRESSED_INSTRUCTION_SIZE,
+        })
+    }
+}
+
+pub fn decode_compressed_instruction(instruction: u16) -> Option<u32> {
+    decompress(instruction).ok()
+}
+
+pub fn encoded_instruction_size(first_half: u16) -> u64 {
+    if first_half & 0b11 == 0b11 {
+        INSTRUCTION_SIZE
+    } else {
+        COMPRESSED_INSTRUCTION_SIZE
+    }
+}
+
+fn decompress(instruction: u16) -> Result<u32, u32> {
+    let raw = u32::from(instruction);
+    let quadrant = raw & 0b11;
+    let funct3 = (raw >> 13) & 0b111;
+    match (quadrant, funct3) {
+        (0b00, 0b000) => {
+            let immediate = c_addi4spn_immediate(raw);
+            if immediate == 0 {
+                Err(raw)
+            } else {
+                Ok(encode_i(
+                    immediate,
+                    2,
+                    FUNCT_ADD,
+                    compressed_rd(raw),
+                    OPCODE_OP_IMM,
+                ))
+            }
+        }
+        (0b00, 0b010) => Ok(encode_i(
+            c_lw_immediate(raw),
+            compressed_rs1(raw),
+            FUNCT_LOAD_WORD,
+            compressed_rd(raw),
+            OPCODE_LOAD,
+        )),
+        (0b00, 0b011) => Ok(encode_i(
+            c_ld_immediate(raw),
+            compressed_rs1(raw),
+            FUNCT_LOAD_DOUBLE,
+            compressed_rd(raw),
+            OPCODE_LOAD,
+        )),
+        (0b00, 0b110) => Ok(encode_s(
+            c_lw_immediate(raw),
+            compressed_rs2(raw),
+            compressed_rs1(raw),
+            FUNCT_STORE_WORD,
+        )),
+        (0b00, 0b111) => Ok(encode_s(
+            c_ld_immediate(raw),
+            compressed_rs2(raw),
+            compressed_rs1(raw),
+            FUNCT_STORE_DOUBLE,
+        )),
+        (0b01, 0b000) => Ok(encode_i(
+            c_i_immediate(raw) as u32,
+            c_rd_rs1(raw),
+            FUNCT_ADD,
+            c_rd_rs1(raw),
+            OPCODE_OP_IMM,
+        )),
+        (0b01, 0b001) => {
+            let rd = c_rd_rs1(raw);
+            if rd == 0 {
+                Err(raw)
+            } else {
+                Ok(encode_i(
+                    c_i_immediate(raw) as u32,
+                    rd,
+                    FUNCT_ADD,
+                    rd,
+                    OPCODE_OP_IMM_32,
+                ))
+            }
+        }
+        (0b01, 0b010) => Ok(encode_i(
+            c_i_immediate(raw) as u32,
+            0,
+            FUNCT_ADD,
+            c_rd_rs1(raw),
+            OPCODE_OP_IMM,
+        )),
+        (0b01, 0b011) => decompress_lui_addi16sp(raw),
+        (0b01, 0b100) => decompress_misc_alu(raw),
+        (0b01, 0b101) => Ok(encode_j(c_j_immediate(raw) as u32, 0)),
+        (0b01, 0b110) => Ok(encode_b(
+            c_b_immediate(raw) as u32,
+            0,
+            compressed_rs1(raw),
+            FUNCT_BRANCH_EQUAL,
+        )),
+        (0b01, 0b111) => Ok(encode_b(
+            c_b_immediate(raw) as u32,
+            0,
+            compressed_rs1(raw),
+            FUNCT_BRANCH_NOT_EQUAL,
+        )),
+        (0b10, 0b000) => {
+            let rd = c_rd_rs1(raw);
+            if rd == 0 {
+                Err(raw)
+            } else {
+                Ok(encode_i(
+                    c_shift_amount(raw),
+                    rd,
+                    FUNCT_SHIFT_LEFT,
+                    rd,
+                    OPCODE_OP_IMM,
+                ))
+            }
+        }
+        (0b10, 0b010) => {
+            let rd = c_rd_rs1(raw);
+            if rd == 0 {
+                Err(raw)
+            } else {
+                Ok(encode_i(
+                    c_lwsp_immediate(raw),
+                    2,
+                    FUNCT_LOAD_WORD,
+                    rd,
+                    OPCODE_LOAD,
+                ))
+            }
+        }
+        (0b10, 0b011) => {
+            let rd = c_rd_rs1(raw);
+            if rd == 0 {
+                Err(raw)
+            } else {
+                Ok(encode_i(
+                    c_ldsp_immediate(raw),
+                    2,
+                    FUNCT_LOAD_DOUBLE,
+                    rd,
+                    OPCODE_LOAD,
+                ))
+            }
+        }
+        (0b10, 0b100) => decompress_jr_mv_ebreak_jalr_add(raw),
+        (0b10, 0b110) => Ok(encode_s(
+            c_swsp_immediate(raw),
+            c_rs2(raw),
+            2,
+            FUNCT_STORE_WORD,
+        )),
+        (0b10, 0b111) => Ok(encode_s(
+            c_sdsp_immediate(raw),
+            c_rs2(raw),
+            2,
+            FUNCT_STORE_DOUBLE,
+        )),
+        _ => Err(raw),
+    }
+}
+
+fn decompress_lui_addi16sp(raw: u32) -> Result<u32, u32> {
+    let rd = c_rd_rs1(raw);
+    if rd == 2 {
+        let immediate = c_addi16sp_immediate(raw);
+        if immediate == 0 {
+            Err(raw)
+        } else {
+            Ok(encode_i(immediate as u32, 2, FUNCT_ADD, 2, OPCODE_OP_IMM))
+        }
+    } else if rd == 0 {
+        Err(raw)
+    } else {
+        let immediate = c_lui_immediate(raw);
+        if immediate == 0 {
+            Err(raw)
+        } else {
+            Ok(encode_u(immediate as u32, rd, OPCODE_LUI))
+        }
+    }
+}
+
+fn decompress_misc_alu(raw: u32) -> Result<u32, u32> {
+    let op = (raw >> 10) & 0b11;
+    let bit12 = (raw >> 12) & 1;
+    let rd = compressed_rs1(raw);
+    match op {
+        0b00 => Ok(encode_i(
+            c_shift_amount(raw),
+            rd,
+            FUNCT_SHIFT_RIGHT,
+            rd,
+            OPCODE_OP_IMM,
+        )),
+        0b01 => Ok(encode_i(
+            0x400 | c_shift_amount(raw),
+            rd,
+            FUNCT_SHIFT_RIGHT,
+            rd,
+            OPCODE_OP_IMM,
+        )),
+        0b10 => Ok(encode_i(
+            c_i_immediate(raw) as u32,
+            rd,
+            FUNCT_AND,
+            rd,
+            OPCODE_OP_IMM,
+        )),
+        0b11 if bit12 == 0 => decompress_register_alu(raw, OPCODE_OP),
+        0b11 => decompress_register_alu(raw, OPCODE_OP_32),
+        _ => Err(raw),
+    }
+}
+
+fn decompress_register_alu(raw: u32, opcode: u32) -> Result<u32, u32> {
+    let rd = compressed_rs1(raw);
+    let rs2 = compressed_rs2(raw);
+    let op = (raw >> 5) & 0b11;
+    let (funct7, funct3) = match (opcode, op) {
+        (OPCODE_OP, 0b00) => (FUNCT7_ALTERNATE, FUNCT_ADD),
+        (OPCODE_OP, 0b01) => (FUNCT7_BASE, FUNCT_XOR),
+        (OPCODE_OP, 0b10) => (FUNCT7_BASE, FUNCT_OR),
+        (OPCODE_OP, 0b11) => (FUNCT7_BASE, FUNCT_AND),
+        (OPCODE_OP_32, 0b00) => (FUNCT7_ALTERNATE, FUNCT_ADD),
+        (OPCODE_OP_32, 0b01) => (FUNCT7_BASE, FUNCT_ADD),
+        _ => return Err(raw),
+    };
+    Ok(encode_r(funct7, rs2, rd, funct3, rd, opcode))
+}
+
+fn decompress_jr_mv_ebreak_jalr_add(raw: u32) -> Result<u32, u32> {
+    let rd_rs1 = c_rd_rs1(raw);
+    let rs2 = c_rs2(raw);
+    let bit12 = (raw >> 12) & 1;
+    match (bit12, rd_rs1, rs2) {
+        (0, 0, _) => Err(raw),
+        (0, _, 0) => Ok(encode_i(0, rd_rs1, FUNCT_ADD, 0, OPCODE_JALR)),
+        (0, _, _) => Ok(encode_r(FUNCT7_BASE, rs2, 0, FUNCT_ADD, rd_rs1, OPCODE_OP)),
+        (1, 0, 0) => Ok(INSTRUCTION_EBREAK),
+        (1, _, 0) => Ok(encode_i(0, rd_rs1, FUNCT_ADD, 1, OPCODE_JALR)),
+        (1, _, _) => Ok(encode_r(
+            FUNCT7_BASE,
+            rs2,
+            rd_rs1,
+            FUNCT_ADD,
+            rd_rs1,
+            OPCODE_OP,
+        )),
+        _ => Err(raw),
+    }
+}
+
+fn c_rd_rs1(raw: u32) -> u32 {
+    (raw >> 7) & 0x1f
+}
+
+fn c_rs2(raw: u32) -> u32 {
+    (raw >> 2) & 0x1f
+}
+
+fn compressed_rd(raw: u32) -> u32 {
+    8 + ((raw >> 2) & 0x7)
+}
+
+fn compressed_rs1(raw: u32) -> u32 {
+    8 + ((raw >> 7) & 0x7)
+}
+
+fn compressed_rs2(raw: u32) -> u32 {
+    8 + ((raw >> 2) & 0x7)
+}
+
+fn c_i_immediate(raw: u32) -> i64 {
+    sign_extend(((raw >> 2) & 0x1f) | (((raw >> 12) & 1) << 5), 6)
+}
+
+fn c_shift_amount(raw: u32) -> u32 {
+    ((raw >> 2) & 0x1f) | (((raw >> 12) & 1) << 5)
+}
+
+fn c_addi4spn_immediate(raw: u32) -> u32 {
+    (((raw >> 7) & 0xf) << 6)
+        | (((raw >> 11) & 0x3) << 4)
+        | (((raw >> 5) & 1) << 3)
+        | (((raw >> 6) & 1) << 2)
+}
+
+fn c_lw_immediate(raw: u32) -> u32 {
+    (((raw >> 10) & 0x7) << 3) | (((raw >> 6) & 1) << 2)
+}
+
+fn c_ld_immediate(raw: u32) -> u32 {
+    (((raw >> 10) & 0x7) << 3) | (((raw >> 5) & 0x3) << 6)
+}
+
+fn c_lwsp_immediate(raw: u32) -> u32 {
+    (((raw >> 12) & 1) << 5) | (((raw >> 4) & 0x7) << 2) | (((raw >> 2) & 0x3) << 6)
+}
+
+fn c_ldsp_immediate(raw: u32) -> u32 {
+    (((raw >> 12) & 1) << 5) | (((raw >> 5) & 0x3) << 3) | (((raw >> 2) & 0x7) << 6)
+}
+
+fn c_swsp_immediate(raw: u32) -> u32 {
+    (((raw >> 9) & 0xf) << 2) | (((raw >> 7) & 0x3) << 6)
+}
+
+fn c_sdsp_immediate(raw: u32) -> u32 {
+    (((raw >> 10) & 0x7) << 3) | (((raw >> 7) & 0x7) << 6)
+}
+
+fn c_addi16sp_immediate(raw: u32) -> i64 {
+    let immediate = (((raw >> 12) & 1) << 9)
+        | (((raw >> 6) & 1) << 4)
+        | (((raw >> 5) & 1) << 6)
+        | (((raw >> 3) & 0x3) << 7)
+        | (((raw >> 2) & 1) << 5);
+    sign_extend(immediate, 10)
+}
+
+fn c_lui_immediate(raw: u32) -> i64 {
+    sign_extend(((raw >> 2) & 0x1f) | (((raw >> 12) & 1) << 5), 6) << 12
+}
+
+fn c_b_immediate(raw: u32) -> i64 {
+    let immediate = (((raw >> 12) & 1) << 8)
+        | (((raw >> 5) & 0x3) << 6)
+        | (((raw >> 2) & 1) << 5)
+        | (((raw >> 10) & 0x3) << 3)
+        | (((raw >> 3) & 0x3) << 1);
+    sign_extend(immediate, 9)
+}
+
+fn c_j_immediate(raw: u32) -> i64 {
+    let immediate = (((raw >> 12) & 1) << 11)
+        | (((raw >> 8) & 1) << 10)
+        | (((raw >> 9) & 0x3) << 8)
+        | (((raw >> 6) & 1) << 7)
+        | (((raw >> 7) & 1) << 6)
+        | (((raw >> 2) & 1) << 5)
+        | (((raw >> 11) & 1) << 4)
+        | (((raw >> 3) & 0x7) << 1);
+    sign_extend(immediate, 12)
+}
+
+fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    (funct7 << FUNCT7_SHIFT)
+        | (rs2 << RS2_SHIFT)
+        | (rs1 << RS1_SHIFT)
+        | (funct3 << FUNCT3_SHIFT)
+        | (rd << RD_SHIFT)
+        | opcode
+}
+
+fn encode_i(immediate: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    ((immediate & 0xfff) << I_IMMEDIATE_SHIFT)
+        | (rs1 << RS1_SHIFT)
+        | (funct3 << FUNCT3_SHIFT)
+        | (rd << RD_SHIFT)
+        | opcode
+}
+
+fn encode_s(immediate: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+    (((immediate >> 5) & 0x7f) << S_IMMEDIATE_HIGH_SHIFT)
+        | (rs2 << RS2_SHIFT)
+        | (rs1 << RS1_SHIFT)
+        | (funct3 << FUNCT3_SHIFT)
+        | ((immediate & 0x1f) << S_IMMEDIATE_LOW_SHIFT)
+        | OPCODE_STORE
+}
+
+fn encode_b(immediate: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+    (((immediate >> 12) & 1) << 31)
+        | (((immediate >> 5) & 0x3f) << 25)
+        | (rs2 << RS2_SHIFT)
+        | (rs1 << RS1_SHIFT)
+        | (funct3 << FUNCT3_SHIFT)
+        | (((immediate >> 1) & 0xf) << 8)
+        | (((immediate >> 11) & 1) << 7)
+        | OPCODE_BRANCH
+}
+
+fn encode_u(immediate: u32, rd: u32, opcode: u32) -> u32 {
+    (immediate & UPPER_IMMEDIATE_MASK) | (rd << RD_SHIFT) | opcode
+}
+
+fn encode_j(immediate: u32, rd: u32) -> u32 {
+    (((immediate >> 20) & 1) << 31)
+        | (((immediate >> 1) & 0x3ff) << 21)
+        | (((immediate >> 11) & 1) << 20)
+        | (((immediate >> 12) & 0xff) << 12)
+        | (rd << RD_SHIFT)
+        | OPCODE_JAL
 }
 
 fn register_field(instruction: u32, shift: u32) -> usize {
@@ -1339,6 +1765,54 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MSTATUS), MSTATUS_WRITABLE_MASK);
         assert_eq!(cpu.csr(CSR_MTVEC), u64::MAX & MTVEC_WRITABLE_MASK);
         assert_eq!(cpu.csr(CSR_MEPC), u64::MAX & MEPC_WRITABLE_MASK);
+    }
+
+    #[test]
+    fn compressed_instructions_execute_and_advance_by_two() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        bus.write_u16(DRAM_START, 0x4085).unwrap();
+        bus.write_u16(DRAM_START + 2, 0x0089).unwrap();
+        bus.write_u16(DRAM_START + 4, 0x9002).unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.pc, DRAM_START + 2);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.pc, DRAM_START + 4);
+        assert_eq!(cpu.register(1), 3);
+        assert_eq!(
+            cpu.step(&mut bus),
+            Ok(Some(HaltReason::Breakpoint { code: 0 }))
+        );
+    }
+
+    #[test]
+    fn compressed_alu_quadrant_distinguishes_shift_and_and_immediates() {
+        assert_eq!(
+            decode_compressed_instruction(0x9005),
+            Some(encode_i(33, 8, FUNCT_SHIFT_RIGHT, 8, OPCODE_OP_IMM))
+        );
+        assert_eq!(
+            decode_compressed_instruction(0x8405),
+            Some(encode_i(0x401, 8, FUNCT_SHIFT_RIGHT, 8, OPCODE_OP_IMM))
+        );
+        assert_eq!(
+            decode_compressed_instruction(0x987d),
+            Some(encode_i(0xfff, 8, FUNCT_AND, 8, OPCODE_OP_IMM))
+        );
+    }
+
+    #[test]
+    fn compressed_branch_uses_halfword_pc_relative_offset() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        bus.write_u16(DRAM_START, 0xc011).unwrap();
+        bus.write_u16(DRAM_START + 4, 0x4085).unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.pc, DRAM_START + 4);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.register(1), 1);
     }
 
     #[test]
