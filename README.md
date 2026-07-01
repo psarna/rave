@@ -10,6 +10,7 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 - RV64A atomic memory operations and LR/SC reservations
 - RV64C compressed integer, control-flow, and load/store instructions
 - Zicsr CSR read/write, set, and clear instructions
+- machine-mode trap entry for exceptions and `mret` trap return
 - Zifencei instruction-fetch fence as a validated no-op
 - RV64 word operations with 32-bit sign extension
 - mixed 16-bit and 32-bit instruction fetch
@@ -58,6 +59,12 @@ Compressed-instruction demo:
 
 ```sh
 cargo run -- demo/rv64c.bin
+```
+
+Machine-trap demo:
+
+```sh
+cargo run -- demo/mtrap.bin
 ```
 
 Auto tests:

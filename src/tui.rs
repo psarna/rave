@@ -23,6 +23,10 @@ const PC_INDEX: usize = 32;
 const INSTRUCTION_SIZE: u64 = 4;
 const PANEL_BORDER_HEIGHT: u16 = 2;
 const BRANCH_OPCODE: u32 = 0x63;
+const INSTRUCTION_ECALL: u32 = 0x0000_0073;
+const INSTRUCTION_MRET: u32 = 0x3020_0073;
+const CSR_MTVEC: u16 = 0x305;
+const CSR_MEPC: u16 = 0x341;
 const REGISTER_NAME_WIDTH: u16 = 8;
 const REGISTER_VALUE_WIDTH: u16 = 18;
 const REGISTER_TABLE_DECORATION_WIDTH: u16 = 6;
@@ -46,6 +50,19 @@ struct JumpInfo {
     rd: usize,
     rs1: usize,
     target: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrapFlowInfo {
+    mnemonic: &'static str,
+    target_label: &'static str,
+    target: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeFlow {
+    target: u64,
+    taken: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,17 +467,17 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
         .wrapping_add(pc & 1);
     let addresses = code_addresses(first, code_rows, debugger);
     let last = addresses.last().copied().unwrap_or(first);
-    let current_branch = read_display_instruction(pc, debugger)
+    let current_flow = read_display_instruction(pc, debugger)
         .ok()
-        .and_then(|instruction| branch_info(instruction.expanded, pc, debugger));
+        .and_then(|instruction| code_flow(instruction.expanded, pc, debugger));
     let lines: Vec<Line<'_>> = addresses
         .into_iter()
         .map(|address| {
             let current = address == pc;
             let breakpoint = debugger.breakpoints().contains(&address);
-            let arrow = current_branch
+            let arrow = current_flow
                 .as_ref()
-                .map(|branch| branch_arrow(address, pc, branch.target, first, last))
+                .map(|flow| branch_arrow(address, pc, flow.target, first, last))
                 .unwrap_or("    ");
             let marker = match (current, breakpoint) {
                 (true, true) => "=>●",
@@ -481,7 +498,7 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                 Span::styled(
                     arrow,
                     base.patch(Style::default().fg(
-                        if current_branch.as_ref().is_some_and(|branch| branch.taken) {
+                        if current_flow.as_ref().is_none_or(|flow| flow.taken) {
                             Color::LightGreen
                         } else {
                             Color::LightRed
@@ -540,6 +557,8 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                                     base.patch(Style::default().fg(Color::Cyan)),
                                 ),
                             ]);
+                        } else if let Some(trap) = decode_trap_flow(instruction, debugger) {
+                            spans.extend(trap_flow_spans(&trap, base));
                         } else if let Some(mem) = decode_mem(instruction, debugger) {
                             let register_name = if mem.register == 0 {
                                 "zero"
@@ -789,11 +808,7 @@ fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &
         ])
     });
     let mut state = TableState::default().with_selected(app.selected_register);
-    let title = match app.mode {
-        Mode::RegisterSelect => " Registers [Tab: prompt, Enter: edit] ",
-        Mode::RegisterEdit => " Registers [live edit; Enter commit, Esc cancel] ",
-        Mode::Command | Mode::UartInput => " Registers [Tab: select] ",
-    };
+    let title = register_pane_title(debugger, app);
     let table = Table::new(
         rows,
         [
@@ -810,6 +825,17 @@ fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &
     )
     .highlight_symbol("> ");
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn register_pane_title(debugger: &Debugger, app: &App) -> String {
+    let mode = debugger.machine.cpu.privilege_mode().label();
+    match app.mode {
+        Mode::RegisterSelect => format!(" Registers [mode: {mode}; Tab: prompt, Enter: edit] "),
+        Mode::RegisterEdit => {
+            format!(" Registers [mode: {mode}; live edit; Enter commit, Esc cancel] ")
+        }
+        Mode::Command | Mode::UartInput => format!(" Registers [mode: {mode}; Tab: select] "),
+    }
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -928,6 +954,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x6f => "jal",
         0x73 if instruction == 0x0010_0073 => "ebreak",
         0x73 if instruction == 0x0000_0073 => "ecall",
+        0x73 if instruction == 0x3020_0073 => "mret",
         0x73 => "system",
         _ => "unknown",
     }
@@ -989,6 +1016,51 @@ fn compressed_jalr_mv_name(raw: u32) -> &'static str {
         (1, _, _) => "c.add",
         _ => "c.unknown",
     }
+}
+
+fn code_flow(instruction: u32, address: u64, debugger: &Debugger) -> Option<CodeFlow> {
+    if let Some(branch) = branch_info(instruction, address, debugger) {
+        return Some(CodeFlow {
+            target: branch.target,
+            taken: branch.taken,
+        });
+    }
+    if let Some(jump) = decode_jump(instruction, address, debugger) {
+        return Some(CodeFlow {
+            target: jump.target,
+            taken: true,
+        });
+    }
+    decode_trap_flow(instruction, debugger).map(|trap| CodeFlow {
+        target: trap.target,
+        taken: true,
+    })
+}
+
+fn decode_trap_flow(instruction: u32, debugger: &Debugger) -> Option<TrapFlowInfo> {
+    match instruction {
+        INSTRUCTION_ECALL => Some(TrapFlowInfo {
+            mnemonic: "ecall",
+            target_label: "mtvec",
+            target: debugger.machine.cpu.csr(CSR_MTVEC) & !0b11,
+        }),
+        INSTRUCTION_MRET => Some(TrapFlowInfo {
+            mnemonic: "mret",
+            target_label: "mepc",
+            target: debugger.machine.cpu.csr(CSR_MEPC),
+        }),
+        _ => None,
+    }
+}
+
+fn trap_flow_spans<'a>(trap: &TrapFlowInfo, base: Style) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(format!("{} -> {} ", trap.mnemonic, trap.target_label), base),
+        Span::styled(
+            format!("{:#018x}", trap.target),
+            base.patch(Style::default().fg(Color::Cyan)),
+        ),
+    ]
 }
 
 fn branch_info(instruction: u32, address: u64, debugger: &Debugger) -> Option<BranchInfo> {
@@ -1756,6 +1828,55 @@ mod tests {
     }
 
     #[test]
+    fn trap_flow_points_ecall_to_mtvec_and_mret_to_mepc() {
+        let mut debugger = debugger();
+        debugger
+            .machine
+            .cpu
+            .set_register(1, Machine::LOAD_ADDRESS + 0x40);
+        debugger
+            .machine
+            .bus
+            .write_u32(
+                Machine::LOAD_ADDRESS,
+                csr_type(u32::from(CSR_MTVEC), 1, 1, 0),
+            )
+            .unwrap();
+        debugger.machine.step().unwrap();
+        debugger
+            .machine
+            .cpu
+            .set_register(1, Machine::LOAD_ADDRESS + 0x80);
+        debugger
+            .machine
+            .bus
+            .write_u32(
+                Machine::LOAD_ADDRESS + 4,
+                csr_type(u32::from(CSR_MEPC), 1, 1, 0),
+            )
+            .unwrap();
+        debugger.machine.step().unwrap();
+
+        let ecall = decode_trap_flow(0x0000_0073, &debugger).unwrap();
+        assert_eq!(ecall.mnemonic, "ecall");
+        assert_eq!(ecall.target_label, "mtvec");
+        assert_eq!(ecall.target, Machine::LOAD_ADDRESS + 0x40);
+
+        let mret = decode_trap_flow(0x3020_0073, &debugger).unwrap();
+        assert_eq!(mret.mnemonic, "mret");
+        assert_eq!(mret.target_label, "mepc");
+        assert_eq!(mret.target, Machine::LOAD_ADDRESS + 0x80);
+
+        assert_eq!(
+            code_flow(0x3020_0073, Machine::LOAD_ADDRESS + 8, &debugger),
+            Some(CodeFlow {
+                target: Machine::LOAD_ADDRESS + 0x80,
+                taken: true,
+            })
+        );
+    }
+
+    #[test]
     fn branch_arrow_connects_source_to_visible_target() {
         let source = Machine::LOAD_ADDRESS + 4;
         let target = Machine::LOAD_ADDRESS + 12;
@@ -1771,6 +1892,13 @@ mod tests {
             branch_arrow(target, source, target, Machine::LOAD_ADDRESS, target),
             "+-> "
         );
+    }
+
+    #[test]
+    fn register_pane_title_includes_privilege_mode() {
+        let debugger = debugger();
+        let app = App::new();
+        assert!(register_pane_title(&debugger, &app).contains("mode: M"));
     }
 
     #[test]
@@ -1987,6 +2115,12 @@ mod tests {
         assert_eq!(subw.rs1, 17);
         assert_eq!(subw.rhs, AluRhs::Register(15));
         assert_eq!(subw.result, 299_997);
+    }
+
+    #[test]
+    fn trap_return_instruction_is_named_in_code_view() {
+        assert_eq!(instruction_name(0x3020_0073), "mret");
+        assert_eq!(instruction_name(0x0000_0073), "ecall");
     }
 
     #[test]
