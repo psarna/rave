@@ -140,6 +140,9 @@ const MSTATUS_MPP_USER: u64 = 0b00 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_SUPERVISOR: u64 = 0b01 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_MACHINE: u64 = 0b11 << MSTATUS_MPP_SHIFT;
 const MSTATUS_WRITABLE_MASK: u64 = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+const MIP_MSIP: u64 = 1 << 3;
+const MIP_MTIP: u64 = 1 << 7;
+const MIP_MEIP: u64 = 1 << 11;
 const MIE_WRITABLE_MASK: u64 = (1 << 3) | (1 << 7) | (1 << 11);
 const MIP_WRITABLE_MASK: u64 = 0;
 const MTVEC_WRITABLE_MASK: u64 = !0b10;
@@ -154,6 +157,10 @@ const TRAP_ILLEGAL_INSTRUCTION: u64 = 2;
 const TRAP_LOAD_ACCESS_FAULT: u64 = 5;
 const TRAP_STORE_ACCESS_FAULT: u64 = 7;
 const TRAP_ECALL_FROM_MACHINE: u64 = 11;
+const INTERRUPT_BIT: u64 = 1 << 63;
+const INTERRUPT_MACHINE_SOFTWARE: u64 = 3;
+const INTERRUPT_MACHINE_TIMER: u64 = 7;
+const INTERRUPT_MACHINE_EXTERNAL: u64 = 11;
 const MTVEC_MODE_MASK: u64 = 0b11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +324,12 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<Option<HaltReason>, StepError> {
         let pc = self.pc;
+        self.refresh_interrupt_pending(bus);
+        if let Some(cause) = self.pending_interrupt() {
+            self.enter_trap(cause, pc, 0, true);
+            return Ok(None);
+        }
+
         let fetched = match fetch_instruction(bus, pc) {
             Ok(fetched) => fetched,
             Err(error) => return self.trap_or_error(error),
@@ -332,6 +345,8 @@ impl Cpu {
         match execution {
             Execution::Continue { next_pc } => {
                 self.csrs.retire_instruction();
+                bus.tick(1);
+                self.refresh_interrupt_pending(bus);
                 self.pc = next_pc;
                 self.registers[ZERO_REGISTER] = 0;
                 Ok(None)
@@ -369,23 +384,23 @@ impl Cpu {
     fn trap_or_error(&mut self, error: StepError) -> Result<Option<HaltReason>, StepError> {
         match error {
             StepError::InstructionAccessFault { pc, address } => {
-                self.enter_trap(TRAP_INSTRUCTION_ACCESS_FAULT, pc, address);
+                self.enter_trap(TRAP_INSTRUCTION_ACCESS_FAULT, pc, address, false);
                 Ok(None)
             }
             StepError::LoadAccessFault { pc, address } => {
-                self.enter_trap(TRAP_LOAD_ACCESS_FAULT, pc, address);
+                self.enter_trap(TRAP_LOAD_ACCESS_FAULT, pc, address, false);
                 Ok(None)
             }
             StepError::StoreAccessFault { pc, address } => {
-                self.enter_trap(TRAP_STORE_ACCESS_FAULT, pc, address);
+                self.enter_trap(TRAP_STORE_ACCESS_FAULT, pc, address, false);
                 Ok(None)
             }
             StepError::IllegalInstruction { pc, instruction } => {
-                self.enter_trap(TRAP_ILLEGAL_INSTRUCTION, pc, u64::from(instruction));
+                self.enter_trap(TRAP_ILLEGAL_INSTRUCTION, pc, u64::from(instruction), false);
                 Ok(None)
             }
             StepError::EnvironmentCall { pc } => {
-                self.enter_trap(TRAP_ECALL_FROM_MACHINE, pc, 0);
+                self.enter_trap(TRAP_ECALL_FROM_MACHINE, pc, 0, false);
                 Ok(None)
             }
             StepError::Bus(error) => Err(StepError::Bus(error)),
@@ -791,9 +806,13 @@ impl Cpu {
         Execution::Continue { next_pc }
     }
 
-    fn enter_trap(&mut self, cause: u64, epc: u64, tval: u64) {
+    fn enter_trap(&mut self, cause: u64, epc: u64, tval: u64, interrupt: bool) {
         self.csrs.mepc = epc & MEPC_WRITABLE_MASK;
-        self.csrs.mcause = cause;
+        self.csrs.mcause = if interrupt {
+            INTERRUPT_BIT | cause
+        } else {
+            cause
+        };
         self.csrs.mtval = tval;
 
         let previous_mode = self.privilege_mode;
@@ -808,8 +827,38 @@ impl Cpu {
             (self.csrs.mstatus & !MSTATUS_MPP_MASK) | mpp_from_privilege_mode(previous_mode);
         self.privilege_mode = PrivilegeMode::Machine;
 
-        self.pc = trap_vector(self.csrs.mtvec, cause, false);
+        self.pc = trap_vector(self.csrs.mtvec, cause, interrupt);
         self.registers[ZERO_REGISTER] = 0;
+    }
+
+    fn refresh_interrupt_pending(&mut self, bus: &Bus) {
+        self.csrs.mip &= !(MIP_MSIP | MIP_MTIP);
+        if bus.machine_software_interrupt_pending() {
+            self.csrs.mip |= MIP_MSIP;
+        }
+        if bus.machine_timer_interrupt_pending() {
+            self.csrs.mip |= MIP_MTIP;
+        }
+    }
+
+    fn pending_interrupt(&self) -> Option<u64> {
+        if !self.machine_interrupts_enabled() {
+            return None;
+        }
+        let pending = self.csrs.mie & self.csrs.mip;
+        if pending & MIP_MEIP != 0 {
+            Some(INTERRUPT_MACHINE_EXTERNAL)
+        } else if pending & MIP_MSIP != 0 {
+            Some(INTERRUPT_MACHINE_SOFTWARE)
+        } else if pending & MIP_MTIP != 0 {
+            Some(INTERRUPT_MACHINE_TIMER)
+        } else {
+            None
+        }
+    }
+
+    fn machine_interrupts_enabled(&self) -> bool {
+        self.privilege_mode != PrivilegeMode::Machine || self.csrs.mstatus & MSTATUS_MIE != 0
     }
 
     fn execute_csr(
@@ -2099,6 +2148,47 @@ mod tests {
         assert_ne!(cpu.csr(CSR_MSTATUS) & MSTATUS_MPIE, 0);
         assert_eq!(cpu.csr(CSR_MSTATUS) & MSTATUS_MPP_MASK, 0);
         assert_eq!(cpu.csr(CSR_INSTRET), 1);
+    }
+
+    #[test]
+    fn enabled_machine_timer_interrupt_enters_trap_before_fetch() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        let vector = DRAM_START + 64;
+        cpu.csrs.mtvec = vector;
+        cpu.csrs.mstatus = MSTATUS_MIE;
+        cpu.csrs.mie = MIP_MTIP;
+        bus.write_u64(crate::bus::CLINT_START + 0x4000, 0).unwrap();
+        bus.write_u32(DRAM_START, 0x0010_8093).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.csr(CSR_MEPC), DRAM_START);
+        assert_eq!(cpu.csr(CSR_MCAUSE), INTERRUPT_BIT | INTERRUPT_MACHINE_TIMER);
+        assert_eq!(cpu.csr(CSR_MTVAL), 0);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_MTIP, MIP_MTIP);
+        assert_eq!(cpu.register(1), 0);
+        assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    #[test]
+    fn vectored_machine_interrupt_uses_cause_offset() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        let vector = DRAM_START + 64;
+        cpu.csrs.mtvec = vector | 1;
+        cpu.csrs.mstatus = MSTATUS_MIE;
+        cpu.csrs.mie = MIP_MSIP;
+        bus.write_u32(crate::bus::CLINT_START, 1).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector + INTERRUPT_MACHINE_SOFTWARE * 4);
+        assert_eq!(
+            cpu.csr(CSR_MCAUSE),
+            INTERRUPT_BIT | INTERRUPT_MACHINE_SOFTWARE
+        );
     }
 
     #[test]

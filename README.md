@@ -17,6 +17,7 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 - raw binaries loaded into DRAM at `0x8000_0000`
 - `ebreak` as a temporary host exit boundary; register `a0` is the result code
 - polled 16550-style UART input and output at `0x1000_0000`
+- CLINT `msip`, `mtimecmp`, and `mtime` registers with machine software/timer interrupts
 
 Run a raw guest image with:
 
@@ -67,9 +68,21 @@ Machine-trap demo:
 cargo run -- demo/mtrap.bin
 ```
 
+Machine-timer interrupt demo:
+
+```sh
+cargo run -- --interactive demo/clint.bin
+```
+
+Machine-software interrupt demo:
+
+```sh
+cargo run -- --interactive demo/msip.bin
+```
+
 Auto tests:
 ```sh
 cargo test
 ```
 
-Privileged modes, virtual memory, interrupts, and functional devices are intentionally not here yet. They will come.
+Supervisor-mode CSRs, virtual memory, PLIC, virtio, and a real firmware/boot path are intentionally not here yet. They will come.

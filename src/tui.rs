@@ -20,6 +20,11 @@ const HELP: &str =
     "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const PC_INDEX: usize = 32;
+const MSIP_INDEX: usize = 33;
+const MTIME_INDEX: usize = 34;
+const MTIMECMP_INDEX: usize = 35;
+const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_INDEX;
+const LAST_EDITABLE_INDEX: usize = MTIMECMP_INDEX;
 const INSTRUCTION_SIZE: u64 = 4;
 const PANEL_BORDER_HEIGHT: u16 = 2;
 const BRANCH_OPCODE: u32 = 0x63;
@@ -82,6 +87,14 @@ struct AluInfo {
     rhs: AluRhs,
     result: u64,
     operator: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpperInfo {
+    mnemonic: &'static str,
+    rd: usize,
+    immediate: u64,
+    result: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,10 +283,10 @@ fn handle_register_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
             app.selected_register = app.selected_register.saturating_sub(1)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.selected_register = (app.selected_register + 1).min(PC_INDEX)
+            app.selected_register = (app.selected_register + 1).min(LAST_EDITABLE_INDEX)
         }
         KeyCode::Home => app.selected_register = 0,
-        KeyCode::End => app.selected_register = PC_INDEX,
+        KeyCode::End => app.selected_register = LAST_EDITABLE_INDEX,
         KeyCode::Enter | KeyCode::Char('e') => {
             app.edit_value = format!("0x{:x}", selected_value(debugger, app.selected_register));
             app.mode = Mode::RegisterEdit;
@@ -437,7 +450,7 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
@@ -447,7 +460,7 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(REGISTER_PANE_WIDTH)])
         .split(outer[0]);
     draw_code(frame, body[0], debugger);
-    draw_registers(frame, body[1], debugger, app);
+    draw_right_column(frame, body[1], debugger, app);
     draw_uart(frame, outer[1], debugger);
     frame.render_widget(
         Paragraph::new(app.status.as_str())
@@ -559,6 +572,26 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                             ]);
                         } else if let Some(trap) = decode_trap_flow(instruction, debugger) {
                             spans.extend(trap_flow_spans(&trap, base));
+                        } else if let Some(upper) = decode_upper(instruction, address) {
+                            let rd_name = if upper.rd == 0 {
+                                "zero"
+                            } else {
+                                REGISTER_NAMES[upper.rd]
+                            };
+                            spans.extend([
+                                Span::styled(format!("{} {},", upper.mnemonic, rd_name), base),
+                                Span::styled(
+                                    format!("{:#x}", upper.immediate),
+                                    base.patch(Style::default().fg(Color::Yellow)),
+                                ),
+                                Span::styled(" -> ", base),
+                                Span::styled(
+                                    format!("{:#018x}", upper.result),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
+                        } else if let Some(misc) = decode_misc_mem(instruction) {
+                            spans.push(Span::styled(misc, base));
                         } else if let Some(mem) = decode_mem(instruction, debugger) {
                             let register_name = if mem.register == 0 {
                                 "zero"
@@ -787,54 +820,113 @@ fn uart_output_text_lines(output: &[u8], max_lines: usize) -> Vec<String> {
     lines[start..].to_vec()
 }
 
+fn draw_right_column(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .split(area);
+    draw_registers(frame, chunks[0], debugger, app);
+    draw_pseudo_registers(frame, chunks[1], debugger, app);
+}
+
 fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
-    let rows = (0..=PC_INDEX).map(|index| {
-        let live_edit = app.mode == Mode::RegisterEdit && index == app.selected_register;
-        let value = if live_edit {
-            rave::debugger_parse_number(&app.edit_value).ok()
-        } else {
-            Some(selected_value(debugger, index))
-        };
-        let value_text = value
-            .map(|value| format!("{value:#018x}"))
-            .unwrap_or_else(|| app.edit_value.clone());
-        Row::new(vec![
-            Cell::from(register_label(index)).style(Style::default().fg(Color::Blue)),
-            Cell::from(value_text).style(Style::default().fg(if live_edit {
-                Color::LightGreen
-            } else {
-                Color::Yellow
-            })),
-        ])
-    });
-    let mut state = TableState::default().with_selected(app.selected_register);
+    let rows = (0..=PC_INDEX).map(|index| editable_row(debugger, app, index));
+    let selected = (app.selected_register <= PC_INDEX).then_some(app.selected_register);
+    let mut state = TableState::default().with_selected(selected);
     let title = register_pane_title(debugger, app);
-    let table = Table::new(
+    let table = editable_table(rows, ["register", "value"])
+        .block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_pseudo_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
+    let rows = (FIRST_PSEUDO_REGISTER_INDEX..=MTIMECMP_INDEX)
+        .map(|index| editable_row(debugger, app, index));
+    let selected = (app.selected_register >= FIRST_PSEUDO_REGISTER_INDEX)
+        .then(|| app.selected_register - FIRST_PSEUDO_REGISTER_INDEX);
+    let mut state = TableState::default().with_selected(selected);
+    let table = editable_table_without_header(rows).block(
+        Block::default()
+            .title(pseudo_register_pane_title(app))
+            .borders(Borders::ALL),
+    );
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn editable_row(debugger: &Debugger, app: &App, index: usize) -> Row<'static> {
+    let live_edit = app.mode == Mode::RegisterEdit && index == app.selected_register;
+    let value = if live_edit {
+        rave::debugger_parse_number(&app.edit_value).ok()
+    } else {
+        Some(selected_value(debugger, index))
+    };
+    let value_text = value
+        .map(|value| format!("{value:#018x}"))
+        .unwrap_or_else(|| app.edit_value.clone());
+    Row::new(vec![
+        Cell::from(register_label(index)).style(Style::default().fg(Color::Blue)),
+        Cell::from(value_text).style(Style::default().fg(if live_edit {
+            Color::LightGreen
+        } else {
+            Color::Yellow
+        })),
+    ])
+}
+
+fn editable_table<'a>(
+    rows: impl IntoIterator<Item = Row<'a>>,
+    header: [&'static str; 2],
+) -> Table<'a> {
+    Table::new(
         rows,
         [
             Constraint::Length(REGISTER_NAME_WIDTH),
             Constraint::Length(REGISTER_VALUE_WIDTH),
         ],
     )
-    .header(Row::new(["register", "value"]).style(Style::default().fg(Color::Yellow)))
-    .block(Block::default().title(title).borders(Borders::ALL))
+    .header(Row::new(header).style(Style::default().fg(Color::Yellow)))
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     )
-    .highlight_symbol("> ");
-    frame.render_stateful_widget(table, area, &mut state);
+    .highlight_symbol("> ")
+}
+
+fn editable_table_without_header<'a>(rows: impl IntoIterator<Item = Row<'a>>) -> Table<'a> {
+    Table::new(
+        rows,
+        [
+            Constraint::Length(REGISTER_NAME_WIDTH),
+            Constraint::Length(REGISTER_VALUE_WIDTH),
+        ],
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ")
 }
 
 fn register_pane_title(debugger: &Debugger, app: &App) -> String {
     let mode = debugger.machine.cpu.privilege_mode().label();
     match app.mode {
-        Mode::RegisterSelect => format!(" Registers [mode: {mode}; Tab: prompt, Enter: edit] "),
+        Mode::RegisterSelect => format!(" Registers [{mode}] "),
         Mode::RegisterEdit => {
-            format!(" Registers [mode: {mode}; live edit; Enter commit, Esc cancel] ")
+            format!(" Registers [{mode}; editing] ")
         }
-        Mode::Command | Mode::UartInput => format!(" Registers [mode: {mode}; Tab: select] "),
+        Mode::Command | Mode::UartInput => format!(" Registers [{mode}] "),
+    }
+}
+
+fn pseudo_register_pane_title(app: &App) -> &'static str {
+    match app.mode {
+        Mode::RegisterSelect => " Pseudo-registers ",
+        Mode::RegisterEdit if app.selected_register >= FIRST_PSEUDO_REGISTER_INDEX => {
+            " Pseudo-registers [editing] "
+        }
+        _ => " Pseudo-registers ",
     }
 }
 
@@ -845,8 +937,8 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.command.as_str(),
         ),
         Mode::RegisterSelect => (
-            " Register navigation ",
-            "↑/↓ select, Enter edit, u undo, r/s/n/c execute, q quit",
+            " Right pane navigation ",
+            "Up/Down select, Enter edit, u undo, r/s/n/c execute, q quit",
         ),
         Mode::RegisterEdit => (" New register value ", app.edit_value.as_str()),
         Mode::UartInput => (
@@ -865,18 +957,22 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn selected_value(debugger: &Debugger, index: usize) -> u64 {
-    if index == PC_INDEX {
-        debugger.machine.cpu.pc
-    } else {
-        debugger.machine.cpu.register(index)
+    match index {
+        PC_INDEX => debugger.machine.cpu.pc,
+        MSIP_INDEX => debugger.machine.bus.msip(),
+        MTIME_INDEX => debugger.machine.bus.mtime(),
+        MTIMECMP_INDEX => debugger.machine.bus.mtimecmp(),
+        _ => debugger.machine.cpu.register(index),
     }
 }
 
 fn register_label(index: usize) -> String {
-    if index == PC_INDEX {
-        "pc".into()
-    } else {
-        format!("x{index:<2} {}", REGISTER_NAMES[index])
+    match index {
+        PC_INDEX => "pc".into(),
+        MSIP_INDEX => "msip".into(),
+        MTIME_INDEX => "mtime".into(),
+        MTIMECMP_INDEX => "mtimecmp".into(),
+        _ => format!("x{index:<2} {}", REGISTER_NAMES[index]),
     }
 }
 
@@ -916,10 +1012,12 @@ fn record_and_set(debugger: &mut Debugger, app: &mut App, index: usize, value: u
 }
 
 fn set_value(debugger: &mut Debugger, index: usize, value: u64) {
-    if index == PC_INDEX {
-        debugger.machine.cpu.pc = value;
-    } else {
-        debugger.machine.cpu.set_register(index, value);
+    match index {
+        PC_INDEX => debugger.machine.cpu.pc = value,
+        MSIP_INDEX => debugger.machine.bus.set_msip(value),
+        MTIME_INDEX => debugger.machine.bus.set_mtime(value),
+        MTIMECMP_INDEX => debugger.machine.bus.set_mtimecmp(value),
+        _ => debugger.machine.cpu.set_register(index, value),
     }
 }
 
@@ -1172,6 +1270,40 @@ fn i_immediate(instruction: u32) -> i64 {
 fn s_immediate(instruction: u32) -> i64 {
     let immediate = ((instruction >> 25) << 5) | ((instruction >> 7) & 0x1f);
     ((immediate << 20) as i32 >> 20) as i64
+}
+
+fn upper_immediate(instruction: u32) -> u64 {
+    (instruction & 0xffff_f000) as i32 as i64 as u64
+}
+
+fn decode_upper(instruction: u32, address: u64) -> Option<UpperInfo> {
+    let rd = ((instruction >> 7) & 0x1f) as usize;
+    let immediate = upper_immediate(instruction);
+    match instruction & 0x7f {
+        0x17 => Some(UpperInfo {
+            mnemonic: "auipc",
+            rd,
+            immediate,
+            result: address.wrapping_add(immediate),
+        }),
+        0x37 => Some(UpperInfo {
+            mnemonic: "lui",
+            rd,
+            immediate,
+            result: immediate,
+        }),
+        _ => None,
+    }
+}
+
+fn decode_misc_mem(instruction: u32) -> Option<&'static str> {
+    if instruction == 0x0000_100f {
+        Some("fence.i")
+    } else if instruction & 0x7f == 0x0f && ((instruction >> 12) & 0x7) == 0 {
+        Some("fence")
+    } else {
+        None
+    }
 }
 
 fn decode_jump(instruction: u32, address: u64, debugger: &Debugger) -> Option<JumpInfo> {
@@ -1640,6 +1772,24 @@ fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
             7 => ("andi", AluRhs::Immediate(imm), lhs & imm as u64, "&"),
             _ => return None,
         }
+    } else if opcode == 0x1b {
+        let imm = i_immediate(instruction);
+        let shift = u64::from((instruction >> 20) & 0x1f);
+        let word = match funct3 {
+            0 => (lhs.wrapping_add(imm as u64) as u32, "addiw", "+w"),
+            1 if (instruction >> 25) & 0x7f == 0 => ((lhs as u32) << shift, "slliw", "<<w"),
+            5 if (instruction >> 25) & 0x7f == 0 => ((lhs as u32) >> shift, "srliw", ">>w"),
+            5 if (instruction >> 25) & 0x7f == 0x20 => {
+                (((lhs as u32 as i32) >> shift) as u32, "sraiw", ">>sw")
+            }
+            _ => return None,
+        };
+        (
+            word.1,
+            AluRhs::Immediate(if funct3 == 0 { imm } else { shift as i64 }),
+            sign_extend_word(word.0),
+            word.2,
+        )
     } else if opcode == 0x33 {
         let rs2 = ((instruction >> 20) & 0x1f) as usize;
         let rhs_val = debugger.machine.cpu.register(rs2);
@@ -1762,6 +1912,21 @@ mod tests {
         assert_eq!(debugger.machine.cpu.pc, Machine::LOAD_ADDRESS);
         undo_last_edit(&mut debugger, &mut app);
         assert_eq!(debugger.machine.cpu.register(10), 0);
+    }
+
+    #[test]
+    fn timer_pseudo_registers_are_editable() {
+        let mut debugger = debugger();
+        let mut app = App::new();
+        record_and_set(&mut debugger, &mut app, MSIP_INDEX, 1);
+        record_and_set(&mut debugger, &mut app, MTIME_INDEX, 12);
+        record_and_set(&mut debugger, &mut app, MTIMECMP_INDEX, 34);
+
+        assert_eq!(debugger.machine.bus.msip(), 1);
+        assert_eq!(debugger.machine.bus.mtime(), 12);
+        assert_eq!(debugger.machine.bus.mtimecmp(), 34);
+        undo_last_edit(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.bus.mtimecmp(), u64::MAX);
     }
 
     #[test]
@@ -1898,7 +2063,34 @@ mod tests {
     fn register_pane_title_includes_privilege_mode() {
         let debugger = debugger();
         let app = App::new();
-        assert!(register_pane_title(&debugger, &app).contains("mode: M"));
+        assert_eq!(register_pane_title(&debugger, &app), " Registers [M] ");
+    }
+
+    #[test]
+    fn split_right_column_renders_at_common_terminal_sizes() {
+        use ratatui::backend::TestBackend;
+
+        for (width, height) in [(80, 24), (100, 30), (120, 40)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let debugger = debugger();
+            let mut app = App::new();
+            terminal
+                .draw(|frame| draw(frame, &debugger, &mut app))
+                .unwrap();
+
+            app.mode = Mode::RegisterSelect;
+            app.selected_register = MTIMECMP_INDEX;
+            terminal
+                .draw(|frame| draw(frame, &debugger, &mut app))
+                .unwrap();
+
+            app.mode = Mode::RegisterEdit;
+            app.edit_value = "0x10".into();
+            terminal
+                .draw(|frame| draw(frame, &debugger, &mut app))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -2072,6 +2264,53 @@ mod tests {
     fn csr_name_prefers_known_machine_names() {
         assert_eq!(csr_name(0x340), "mscratch");
         assert_eq!(csr_name(0x777), "0x777");
+    }
+
+    #[test]
+    fn upper_immediate_decoder_previews_lui_and_auipc() {
+        let lui = decode_upper(0x1234_52b7, Machine::LOAD_ADDRESS).unwrap();
+        assert_eq!(lui.mnemonic, "lui");
+        assert_eq!(lui.rd, 5);
+        assert_eq!(lui.immediate, 0x1234_5000);
+        assert_eq!(lui.result, 0x1234_5000);
+
+        let auipc = decode_upper(0xffff_f317, Machine::LOAD_ADDRESS + 4).unwrap();
+        assert_eq!(auipc.mnemonic, "auipc");
+        assert_eq!(auipc.rd, 6);
+        assert_eq!(auipc.immediate, 0xffff_ffff_ffff_f000);
+        assert_eq!(auipc.result, Machine::LOAD_ADDRESS - 0xffc);
+    }
+
+    #[test]
+    fn misc_mem_decoder_names_fences() {
+        assert_eq!(decode_misc_mem(0x0000_000f), Some("fence"));
+        assert_eq!(decode_misc_mem(0x0000_100f), Some("fence.i"));
+        assert_eq!(decode_misc_mem(0x0000_200f), None);
+    }
+
+    #[test]
+    fn alu_decoder_previews_word_immediate_operations() {
+        let mut debugger = debugger();
+        debugger.machine.cpu.set_register(1, 0xffff_ffff_8000_0001);
+
+        let addiw = decode_alu(i_type(0xfff, 1, 0, 5, 0x1b), &debugger).unwrap();
+        assert_eq!(addiw.mnemonic, "addiw");
+        assert_eq!(addiw.rd, 5);
+        assert_eq!(addiw.rs1, 1);
+        assert_eq!(addiw.rhs, AluRhs::Immediate(-1));
+        assert_eq!(addiw.result, 0xffff_ffff_8000_0000);
+
+        let slliw = decode_alu(i_type(1, 1, 1, 6, 0x1b), &debugger).unwrap();
+        assert_eq!(slliw.mnemonic, "slliw");
+        assert_eq!(slliw.result, 2);
+
+        let srliw = decode_alu(i_type(1, 1, 5, 7, 0x1b), &debugger).unwrap();
+        assert_eq!(srliw.mnemonic, "srliw");
+        assert_eq!(srliw.result, 0x4000_0000);
+
+        let sraiw = decode_alu(i_type(0x401, 1, 5, 8, 0x1b), &debugger).unwrap();
+        assert_eq!(sraiw.mnemonic, "sraiw");
+        assert_eq!(sraiw.result, 0xffff_ffff_c000_0000);
     }
 
     #[test]

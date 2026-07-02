@@ -51,6 +51,20 @@ fn compiles_and_runs_a_machine_trap_guest() {
     assert_eq!(result.uart_output, b"TU");
 }
 
+#[test]
+fn compiles_and_runs_a_machine_timer_interrupt_guest() {
+    let result = compile_and_run_guest_with_march("clint", "rv64im_zicsr", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"I");
+}
+
+#[test]
+fn compiles_and_runs_a_machine_software_interrupt_guest() {
+    let result = compile_and_run_guest_with_march("msip", "rv64im_zicsr", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"S");
+}
+
 struct GuestResult {
     reason: HaltReason,
     uart_output: Vec<u8>,
