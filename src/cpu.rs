@@ -111,6 +111,7 @@ const SHIFT32_MASK: u32 = 0x1f;
 const INSTRUCTION_ECALL: u32 = 0x0000_0073;
 const INSTRUCTION_EBREAK: u32 = 0x0010_0073;
 const INSTRUCTION_MRET: u32 = 0x3020_0073;
+const INSTRUCTION_SRET: u32 = 0x1020_0073;
 const INSTRUCTION_FENCE_I: u32 = 0x0000_100f;
 const UPPER_IMMEDIATE_MASK: u32 = 0xffff_f000;
 const JALR_ALIGNMENT_MASK: u64 = !1;
@@ -121,6 +122,8 @@ const CSR_MIMPID: u16 = 0xf13;
 const CSR_MHARTID: u16 = 0xf14;
 const CSR_MSTATUS: u16 = 0x300;
 const CSR_MISA: u16 = 0x301;
+const CSR_MEDELEG: u16 = 0x302;
+const CSR_MIDELEG: u16 = 0x303;
 const CSR_MIE: u16 = 0x304;
 const CSR_MTVEC: u16 = 0x305;
 const CSR_MSCRATCH: u16 = 0x340;
@@ -128,40 +131,91 @@ const CSR_MEPC: u16 = 0x341;
 const CSR_MCAUSE: u16 = 0x342;
 const CSR_MTVAL: u16 = 0x343;
 const CSR_MIP: u16 = 0x344;
+const CSR_SSTATUS: u16 = 0x100;
+const CSR_SIE: u16 = 0x104;
+const CSR_STVEC: u16 = 0x105;
+const CSR_SSCRATCH: u16 = 0x140;
+const CSR_SEPC: u16 = 0x141;
+const CSR_SCAUSE: u16 = 0x142;
+const CSR_STVAL: u16 = 0x143;
+const CSR_SIP: u16 = 0x144;
+const CSR_SATP: u16 = 0x180;
 const CSR_CYCLE: u16 = 0xc00;
 const CSR_TIME: u16 = 0xc01;
 const CSR_INSTRET: u16 = 0xc02;
 
+const MSTATUS_SIE: u64 = 1 << 1;
 const MSTATUS_MIE: u64 = 1 << 3;
+const MSTATUS_SPIE: u64 = 1 << 5;
 const MSTATUS_MPIE: u64 = 1 << 7;
+const MSTATUS_SPP: u64 = 1 << 8;
 const MSTATUS_MPP_SHIFT: u64 = 11;
 const MSTATUS_MPP_MASK: u64 = 0b11 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_USER: u64 = 0b00 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_SUPERVISOR: u64 = 0b01 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_MACHINE: u64 = 0b11 << MSTATUS_MPP_SHIFT;
-const MSTATUS_WRITABLE_MASK: u64 = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+const SSTATUS_WRITABLE_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+const MSTATUS_WRITABLE_MASK: u64 =
+    SSTATUS_WRITABLE_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+const MIP_SSIP: u64 = 1 << 1;
 const MIP_MSIP: u64 = 1 << 3;
+const MIP_STIP: u64 = 1 << 5;
 const MIP_MTIP: u64 = 1 << 7;
+const MIP_SEIP: u64 = 1 << 9;
 const MIP_MEIP: u64 = 1 << 11;
-const MIE_WRITABLE_MASK: u64 = (1 << 3) | (1 << 7) | (1 << 11);
-const MIP_WRITABLE_MASK: u64 = 0;
+const S_INTERRUPT_MASK: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP;
+const M_INTERRUPT_MASK: u64 = MIP_MSIP | MIP_MTIP | MIP_MEIP;
+const MIE_WRITABLE_MASK: u64 = S_INTERRUPT_MASK | M_INTERRUPT_MASK;
+const MIP_WRITABLE_MASK: u64 = S_INTERRUPT_MASK;
 const MTVEC_WRITABLE_MASK: u64 = !0b10;
 const MEPC_WRITABLE_MASK: u64 = !1;
 const MCAUSE_WRITABLE_MASK: u64 = u64::MAX;
 const MTVAL_WRITABLE_MASK: u64 = u64::MAX;
 const MSCRATCH_WRITABLE_MASK: u64 = u64::MAX;
-const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
+const MEDELEG_WRITABLE_MASK: u64 = u64::MAX;
+const MIDELEG_WRITABLE_MASK: u64 = S_INTERRUPT_MASK;
+const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 18);
 
 const TRAP_INSTRUCTION_ACCESS_FAULT: u64 = 1;
 const TRAP_ILLEGAL_INSTRUCTION: u64 = 2;
 const TRAP_LOAD_ACCESS_FAULT: u64 = 5;
 const TRAP_STORE_ACCESS_FAULT: u64 = 7;
+const TRAP_ECALL_FROM_USER: u64 = 8;
+const TRAP_ECALL_FROM_SUPERVISOR: u64 = 9;
 const TRAP_ECALL_FROM_MACHINE: u64 = 11;
+const TRAP_INSTRUCTION_PAGE_FAULT: u64 = 12;
+const TRAP_LOAD_PAGE_FAULT: u64 = 13;
+const TRAP_STORE_PAGE_FAULT: u64 = 15;
 const INTERRUPT_BIT: u64 = 1 << 63;
+const INTERRUPT_SUPERVISOR_SOFTWARE: u64 = 1;
 const INTERRUPT_MACHINE_SOFTWARE: u64 = 3;
+const INTERRUPT_SUPERVISOR_TIMER: u64 = 5;
 const INTERRUPT_MACHINE_TIMER: u64 = 7;
+const INTERRUPT_SUPERVISOR_EXTERNAL: u64 = 9;
 const INTERRUPT_MACHINE_EXTERNAL: u64 = 11;
 const MTVEC_MODE_MASK: u64 = 0b11;
+const SATP_MODE_SHIFT: u64 = 60;
+const SATP_MODE_BARE: u64 = 0;
+const SATP_MODE_SV39: u64 = 8;
+const SATP_ASID_MASK: u64 = 0xffff << 44;
+const SATP_PPN_MASK: u64 = (1 << 44) - 1;
+const PAGE_SHIFT: u64 = 12;
+const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
+const PAGE_OFFSET_MASK: u64 = PAGE_SIZE - 1;
+const PTE_SIZE: u64 = 8;
+const PTE_V: u64 = 1 << 0;
+const PTE_R: u64 = 1 << 1;
+const PTE_W: u64 = 1 << 2;
+const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
+const PTE_PPN_SHIFT: u64 = 10;
+const PTE_PPN_MASK: u64 = (1 << 44) - 1;
+const VPN_MASK: u64 = 0x1ff;
+const SV39_VA_BITS: u32 = 39;
+const SV39_LEVELS: usize = 3;
+const SV39_TOP_LEVEL: usize = SV39_LEVELS - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegeMode {
@@ -191,8 +245,25 @@ pub enum StepError {
     InstructionAccessFault { pc: u64, address: u64 },
     LoadAccessFault { pc: u64, address: u64 },
     StoreAccessFault { pc: u64, address: u64 },
+    InstructionPageFault { pc: u64, address: u64 },
+    LoadPageFault { pc: u64, address: u64 },
+    StorePageFault { pc: u64, address: u64 },
     IllegalInstruction { pc: u64, instruction: u32 },
     EnvironmentCall { pc: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressAccess {
+    Fetch,
+    Load,
+    Store,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressTranslation {
+    pub physical_address: u64,
+    pub paging_active: bool,
+    pte_update: Option<(u64, u64)>,
 }
 
 impl fmt::Display for StepError {
@@ -213,6 +284,18 @@ impl fmt::Display for StepError {
                     f,
                     "store access fault at {pc:#018x} writing {address:#018x}"
                 )
+            }
+            Self::InstructionPageFault { pc, address } => {
+                write!(
+                    f,
+                    "instruction page fault at {pc:#018x} reading {address:#018x}"
+                )
+            }
+            Self::LoadPageFault { pc, address } => {
+                write!(f, "load page fault at {pc:#018x} reading {address:#018x}")
+            }
+            Self::StorePageFault { pc, address } => {
+                write!(f, "store page fault at {pc:#018x} writing {address:#018x}")
             }
             Self::IllegalInstruction { pc, instruction } => {
                 write!(f, "illegal instruction {instruction:#010x} at {pc:#018x}")
@@ -242,6 +325,8 @@ pub struct Cpu {
 #[derive(Debug, Clone, Default)]
 struct CsrFile {
     mstatus: u64,
+    medeleg: u64,
+    mideleg: u64,
     mie: u64,
     mtvec: u64,
     mscratch: u64,
@@ -249,6 +334,12 @@ struct CsrFile {
     mcause: u64,
     mtval: u64,
     mip: u64,
+    stvec: u64,
+    sscratch: u64,
+    sepc: u64,
+    scause: u64,
+    stval: u64,
+    satp: u64,
     cycle: u64,
     instret: u64,
 }
@@ -282,6 +373,23 @@ impl Decoded {
 struct Fetched {
     raw: u32,
     size: u64,
+}
+
+#[derive(Clone, Copy)]
+enum MemoryAccess {
+    Fetch,
+    Load,
+    Store,
+}
+
+impl From<AddressAccess> for MemoryAccess {
+    fn from(value: AddressAccess) -> Self {
+        match value {
+            AddressAccess::Fetch => Self::Fetch,
+            AddressAccess::Load => Self::Load,
+            AddressAccess::Store => Self::Store,
+        }
+    }
 }
 
 enum Execution {
@@ -322,6 +430,15 @@ impl Cpu {
         self.reservation == Some(address)
     }
 
+    pub fn translate_address_for_debug(
+        &self,
+        bus: &Bus,
+        address: u64,
+        access: AddressAccess,
+    ) -> Result<AddressTranslation, StepError> {
+        self.translate_address_inner(bus, address, access.into())
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<Option<HaltReason>, StepError> {
         let pc = self.pc;
         self.refresh_interrupt_pending(bus);
@@ -330,7 +447,7 @@ impl Cpu {
             return Ok(None);
         }
 
-        let fetched = match fetch_instruction(bus, pc) {
+        let fetched = match self.fetch_instruction(bus, pc) {
             Ok(fetched) => fetched,
             Err(error) => return self.trap_or_error(error),
         };
@@ -400,7 +517,19 @@ impl Cpu {
                 Ok(None)
             }
             StepError::EnvironmentCall { pc } => {
-                self.enter_trap(TRAP_ECALL_FROM_MACHINE, pc, 0, false);
+                self.enter_trap(self.environment_call_cause(), pc, 0, false);
+                Ok(None)
+            }
+            StepError::InstructionPageFault { pc, address } => {
+                self.enter_trap(TRAP_INSTRUCTION_PAGE_FAULT, pc, address, false);
+                Ok(None)
+            }
+            StepError::LoadPageFault { pc, address } => {
+                self.enter_trap(TRAP_LOAD_PAGE_FAULT, pc, address, false);
+                Ok(None)
+            }
+            StepError::StorePageFault { pc, address } => {
+                self.enter_trap(TRAP_STORE_PAGE_FAULT, pc, address, false);
                 Ok(None)
             }
             StepError::Bus(error) => Err(StepError::Bus(error)),
@@ -470,38 +599,22 @@ impl Cpu {
     fn execute_load(
         &mut self,
         instruction: Decoded,
-        bus: &Bus,
+        bus: &mut Bus,
         next_pc: u64,
     ) -> Result<Execution, StepError> {
         let address = self.effective_i_address(instruction);
         let value = match instruction.funct3 {
-            FUNCT_LOAD_BYTE => bus
-                .read_u8(address)
-                .map_err(|error| load_access_fault(self.pc, error))?
-                as i8 as i64 as u64,
-            FUNCT_LOAD_HALF => bus
-                .read_u16(address)
-                .map_err(|error| load_access_fault(self.pc, error))?
-                as i16 as i64 as u64,
-            FUNCT_LOAD_WORD => bus
-                .read_u32(address)
-                .map_err(|error| load_access_fault(self.pc, error))?
-                as i32 as i64 as u64,
-            FUNCT_LOAD_DOUBLE => bus
-                .read_u64(address)
-                .map_err(|error| load_access_fault(self.pc, error))?,
-            FUNCT_LOAD_BYTE_UNSIGNED => {
-                bus.read_u8(address)
-                    .map_err(|error| load_access_fault(self.pc, error))? as u64
+            FUNCT_LOAD_BYTE => self.read_u8(bus, address, MemoryAccess::Load)? as i8 as i64 as u64,
+            FUNCT_LOAD_HALF => {
+                self.read_u16(bus, address, MemoryAccess::Load)? as i16 as i64 as u64
             }
-            FUNCT_LOAD_HALF_UNSIGNED => {
-                bus.read_u16(address)
-                    .map_err(|error| load_access_fault(self.pc, error))? as u64
+            FUNCT_LOAD_WORD => {
+                self.read_u32(bus, address, MemoryAccess::Load)? as i32 as i64 as u64
             }
-            FUNCT_LOAD_WORD_UNSIGNED => {
-                bus.read_u32(address)
-                    .map_err(|error| load_access_fault(self.pc, error))? as u64
-            }
+            FUNCT_LOAD_DOUBLE => self.read_u64(bus, address, MemoryAccess::Load)?,
+            FUNCT_LOAD_BYTE_UNSIGNED => self.read_u8(bus, address, MemoryAccess::Load)? as u64,
+            FUNCT_LOAD_HALF_UNSIGNED => self.read_u16(bus, address, MemoryAccess::Load)? as u64,
+            FUNCT_LOAD_WORD_UNSIGNED => self.read_u32(bus, address, MemoryAccess::Load)? as u64,
             _ => return Err(illegal(self.pc, instruction.raw)),
         };
         self.set_register(instruction.rd, value);
@@ -518,18 +631,10 @@ impl Cpu {
             self.registers[instruction.rs1].wrapping_add(s_immediate(instruction.raw) as u64);
         let value = self.registers[instruction.rs2];
         match instruction.funct3 {
-            FUNCT_STORE_BYTE => bus
-                .write_u8(address, value as u8)
-                .map_err(|error| store_access_fault(self.pc, error))?,
-            FUNCT_STORE_HALF => bus
-                .write_u16(address, value as u16)
-                .map_err(|error| store_access_fault(self.pc, error))?,
-            FUNCT_STORE_WORD => bus
-                .write_u32(address, value as u32)
-                .map_err(|error| store_access_fault(self.pc, error))?,
-            FUNCT_STORE_DOUBLE => bus
-                .write_u64(address, value)
-                .map_err(|error| store_access_fault(self.pc, error))?,
+            FUNCT_STORE_BYTE => self.write_u8(bus, address, value as u8)?,
+            FUNCT_STORE_HALF => self.write_u16(bus, address, value as u16)?,
+            FUNCT_STORE_WORD => self.write_u32(bus, address, value as u32)?,
+            FUNCT_STORE_DOUBLE => self.write_u64(bus, address, value)?,
             _ => return Err(illegal(self.pc, instruction.raw)),
         }
         self.clear_reservation_for_store(address);
@@ -563,9 +668,7 @@ impl Cpu {
             if instruction.rs2 != ZERO_REGISTER {
                 return Err(illegal(self.pc, instruction.raw));
             }
-            let old = bus
-                .read_u32(address)
-                .map_err(|error| load_access_fault(self.pc, error))?;
+            let old = self.read_u32(bus, address, MemoryAccess::Load)?;
             self.reservation = Some(address);
             self.set_register(instruction.rd, sign_extend_word(old));
             return Ok(());
@@ -575,16 +678,13 @@ impl Cpu {
             let success = self.reservation == Some(address);
             self.reservation = None;
             if success {
-                bus.write_u32(address, self.registers[instruction.rs2] as u32)
-                    .map_err(|error| store_access_fault(self.pc, error))?;
+                self.write_u32(bus, address, self.registers[instruction.rs2] as u32)?;
             }
             self.set_register(instruction.rd, (!success) as u64);
             return Ok(());
         }
 
-        let old = bus
-            .read_u32(address)
-            .map_err(|error| store_access_fault(self.pc, error))?;
+        let old = self.read_u32(bus, address, MemoryAccess::Store)?;
         let rhs = self.registers[instruction.rs2] as u32;
         let new = match funct5 {
             AMO_FUNCT_SWAP => rhs,
@@ -598,8 +698,7 @@ impl Cpu {
             AMO_FUNCT_MAX_UNSIGNED => old.max(rhs),
             _ => return Err(illegal(self.pc, instruction.raw)),
         };
-        bus.write_u32(address, new)
-            .map_err(|error| store_access_fault(self.pc, error))?;
+        self.write_u32(bus, address, new)?;
         self.clear_reservation_for_store(address);
         self.set_register(instruction.rd, sign_extend_word(old));
         Ok(())
@@ -616,9 +715,7 @@ impl Cpu {
             if instruction.rs2 != ZERO_REGISTER {
                 return Err(illegal(self.pc, instruction.raw));
             }
-            let old = bus
-                .read_u64(address)
-                .map_err(|error| load_access_fault(self.pc, error))?;
+            let old = self.read_u64(bus, address, MemoryAccess::Load)?;
             self.reservation = Some(address);
             self.set_register(instruction.rd, old);
             return Ok(());
@@ -628,16 +725,13 @@ impl Cpu {
             let success = self.reservation == Some(address);
             self.reservation = None;
             if success {
-                bus.write_u64(address, self.registers[instruction.rs2])
-                    .map_err(|error| store_access_fault(self.pc, error))?;
+                self.write_u64(bus, address, self.registers[instruction.rs2])?;
             }
             self.set_register(instruction.rd, (!success) as u64);
             return Ok(());
         }
 
-        let old = bus
-            .read_u64(address)
-            .map_err(|error| store_access_fault(self.pc, error))?;
+        let old = self.read_u64(bus, address, MemoryAccess::Store)?;
         let rhs = self.registers[instruction.rs2];
         let new = match funct5 {
             AMO_FUNCT_SWAP => rhs,
@@ -651,8 +745,7 @@ impl Cpu {
             AMO_FUNCT_MAX_UNSIGNED => old.max(rhs),
             _ => return Err(illegal(self.pc, instruction.raw)),
         };
-        bus.write_u64(address, new)
-            .map_err(|error| store_access_fault(self.pc, error))?;
+        self.write_u64(bus, address, new)?;
         self.clear_reservation_for_store(address);
         self.set_register(instruction.rd, old);
         Ok(())
@@ -785,7 +878,12 @@ impl Cpu {
                 code: self.registers[RETURN_VALUE_REGISTER],
             })),
             INSTRUCTION_ECALL => Err(StepError::EnvironmentCall { pc }),
-            INSTRUCTION_MRET => Ok(self.execute_mret()),
+            INSTRUCTION_MRET if self.privilege_mode == PrivilegeMode::Machine => {
+                Ok(self.execute_mret())
+            }
+            INSTRUCTION_SRET if self.privilege_mode != PrivilegeMode::User => {
+                Ok(self.execute_sret())
+            }
             _ if instruction.funct3 == FUNCT_SYSTEM_PRIVILEGED => Err(illegal(pc, instruction.raw)),
             _ => self.execute_csr(instruction, pc, next_pc),
         }
@@ -806,13 +904,48 @@ impl Cpu {
         Execution::Continue { next_pc }
     }
 
-    fn enter_trap(&mut self, cause: u64, epc: u64, tval: u64, interrupt: bool) {
-        self.csrs.mepc = epc & MEPC_WRITABLE_MASK;
-        self.csrs.mcause = if interrupt {
-            INTERRUPT_BIT | cause
+    fn execute_sret(&mut self) -> Execution {
+        let next_pc = self.csrs.sepc;
+        let next_mode = if self.csrs.mstatus & MSTATUS_SPP != 0 {
+            PrivilegeMode::Supervisor
         } else {
-            cause
+            PrivilegeMode::User
         };
+        let spie = self.csrs.mstatus & MSTATUS_SPIE != 0;
+        if spie {
+            self.csrs.mstatus |= MSTATUS_SIE;
+        } else {
+            self.csrs.mstatus &= !MSTATUS_SIE;
+        }
+        self.csrs.mstatus |= MSTATUS_SPIE;
+        self.csrs.mstatus &= !MSTATUS_SPP;
+        self.privilege_mode = next_mode;
+        Execution::Continue { next_pc }
+    }
+
+    fn enter_trap(&mut self, cause: u64, epc: u64, tval: u64, interrupt: bool) {
+        if self.trap_delegated_to_supervisor(cause, interrupt) {
+            self.enter_supervisor_trap(cause, epc, tval, interrupt);
+        } else {
+            self.enter_machine_trap(cause, epc, tval, interrupt);
+        }
+    }
+
+    fn trap_delegated_to_supervisor(&self, cause: u64, interrupt: bool) -> bool {
+        if self.privilege_mode == PrivilegeMode::Machine {
+            return false;
+        }
+        let delegation = if interrupt {
+            self.csrs.mideleg
+        } else {
+            self.csrs.medeleg
+        };
+        delegation & (1 << cause) != 0
+    }
+
+    fn enter_machine_trap(&mut self, cause: u64, epc: u64, tval: u64, interrupt: bool) {
+        self.csrs.mepc = epc & MEPC_WRITABLE_MASK;
+        self.csrs.mcause = trap_cause_value(cause, interrupt);
         self.csrs.mtval = tval;
 
         let previous_mode = self.privilege_mode;
@@ -831,6 +964,30 @@ impl Cpu {
         self.registers[ZERO_REGISTER] = 0;
     }
 
+    fn enter_supervisor_trap(&mut self, cause: u64, epc: u64, tval: u64, interrupt: bool) {
+        self.csrs.sepc = epc & MEPC_WRITABLE_MASK;
+        self.csrs.scause = trap_cause_value(cause, interrupt);
+        self.csrs.stval = tval;
+
+        let previous_mode = self.privilege_mode;
+        let sie = self.csrs.mstatus & MSTATUS_SIE != 0;
+        if sie {
+            self.csrs.mstatus |= MSTATUS_SPIE;
+        } else {
+            self.csrs.mstatus &= !MSTATUS_SPIE;
+        }
+        self.csrs.mstatus &= !MSTATUS_SIE;
+        if previous_mode == PrivilegeMode::Supervisor {
+            self.csrs.mstatus |= MSTATUS_SPP;
+        } else {
+            self.csrs.mstatus &= !MSTATUS_SPP;
+        }
+        self.privilege_mode = PrivilegeMode::Supervisor;
+
+        self.pc = trap_vector(self.csrs.stvec, cause, interrupt);
+        self.registers[ZERO_REGISTER] = 0;
+    }
+
     fn refresh_interrupt_pending(&mut self, bus: &Bus) {
         self.csrs.mip &= !(MIP_MSIP | MIP_MTIP);
         if bus.machine_software_interrupt_pending() {
@@ -842,23 +999,42 @@ impl Cpu {
     }
 
     fn pending_interrupt(&self) -> Option<u64> {
-        if !self.machine_interrupts_enabled() {
-            return None;
-        }
         let pending = self.csrs.mie & self.csrs.mip;
-        if pending & MIP_MEIP != 0 {
-            Some(INTERRUPT_MACHINE_EXTERNAL)
-        } else if pending & MIP_MSIP != 0 {
-            Some(INTERRUPT_MACHINE_SOFTWARE)
-        } else if pending & MIP_MTIP != 0 {
-            Some(INTERRUPT_MACHINE_TIMER)
-        } else {
-            None
+        if self.machine_interrupts_enabled() {
+            let machine_pending = pending & !self.csrs.mideleg;
+            if machine_pending & MIP_MEIP != 0 {
+                return Some(INTERRUPT_MACHINE_EXTERNAL);
+            }
+            if machine_pending & MIP_MSIP != 0 {
+                return Some(INTERRUPT_MACHINE_SOFTWARE);
+            }
+            if machine_pending & MIP_MTIP != 0 {
+                return Some(INTERRUPT_MACHINE_TIMER);
+            }
         }
+        if self.supervisor_interrupts_enabled() {
+            let supervisor_pending = pending & self.csrs.mideleg;
+            if supervisor_pending & MIP_SEIP != 0 {
+                return Some(INTERRUPT_SUPERVISOR_EXTERNAL);
+            }
+            if supervisor_pending & MIP_SSIP != 0 {
+                return Some(INTERRUPT_SUPERVISOR_SOFTWARE);
+            }
+            if supervisor_pending & MIP_STIP != 0 {
+                return Some(INTERRUPT_SUPERVISOR_TIMER);
+            }
+        }
+        None
     }
 
     fn machine_interrupts_enabled(&self) -> bool {
         self.privilege_mode != PrivilegeMode::Machine || self.csrs.mstatus & MSTATUS_MIE != 0
+    }
+
+    fn supervisor_interrupts_enabled(&self) -> bool {
+        self.privilege_mode == PrivilegeMode::User
+            || (self.privilege_mode == PrivilegeMode::Supervisor
+                && self.csrs.mstatus & MSTATUS_SIE != 0)
     }
 
     fn execute_csr(
@@ -868,6 +1044,9 @@ impl Cpu {
         next_pc: u64,
     ) -> Result<Execution, StepError> {
         let address = csr_address(instruction.raw);
+        if !csr_accessible(address, self.privilege_mode) {
+            return Err(illegal(pc, instruction.raw));
+        }
         let old_value = self
             .csrs
             .read(address)
@@ -909,14 +1088,195 @@ impl Cpu {
         Ok(Execution::Continue { next_pc })
     }
 
+    fn environment_call_cause(&self) -> u64 {
+        match self.privilege_mode {
+            PrivilegeMode::User => TRAP_ECALL_FROM_USER,
+            PrivilegeMode::Supervisor => TRAP_ECALL_FROM_SUPERVISOR,
+            PrivilegeMode::Machine => TRAP_ECALL_FROM_MACHINE,
+        }
+    }
+
     fn effective_i_address(&self, instruction: Decoded) -> u64 {
         self.registers[instruction.rs1].wrapping_add(i_immediate(instruction.raw) as u64)
+    }
+
+    fn fetch_instruction(&mut self, bus: &mut Bus, pc: u64) -> Result<Fetched, StepError> {
+        let physical_pc = self.translate_address(bus, pc, MemoryAccess::Fetch)?;
+        let half = bus
+            .read_u16(physical_pc)
+            .map_err(|error| instruction_access_fault(pc, error))?;
+        if half & 0b11 == 0b11 {
+            Ok(Fetched {
+                raw: bus
+                    .read_u32(physical_pc)
+                    .map_err(|error| instruction_access_fault(pc, error))?,
+                size: INSTRUCTION_SIZE,
+            })
+        } else {
+            let raw = decompress(half)
+                .map_err(|instruction| StepError::IllegalInstruction { pc, instruction })?;
+            Ok(Fetched {
+                raw,
+                size: COMPRESSED_INSTRUCTION_SIZE,
+            })
+        }
+    }
+
+    fn read_u8(
+        &mut self,
+        bus: &mut Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<u8, StepError> {
+        let physical = self.translate_address(bus, address, access)?;
+        bus.read_u8(physical)
+            .map_err(|error| access_fault(self.pc, address, access, error))
+    }
+
+    fn read_u16(
+        &mut self,
+        bus: &mut Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<u16, StepError> {
+        let physical = self.translate_address(bus, address, access)?;
+        bus.read_u16(physical)
+            .map_err(|error| access_fault(self.pc, address, access, error))
+    }
+
+    fn read_u32(
+        &mut self,
+        bus: &mut Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<u32, StepError> {
+        let physical = self.translate_address(bus, address, access)?;
+        bus.read_u32(physical)
+            .map_err(|error| access_fault(self.pc, address, access, error))
+    }
+
+    fn read_u64(
+        &mut self,
+        bus: &mut Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<u64, StepError> {
+        let physical = self.translate_address(bus, address, access)?;
+        bus.read_u64(physical)
+            .map_err(|error| access_fault(self.pc, address, access, error))
+    }
+
+    fn write_u8(&mut self, bus: &mut Bus, address: u64, value: u8) -> Result<(), StepError> {
+        let physical = self.translate_address(bus, address, MemoryAccess::Store)?;
+        bus.write_u8(physical, value)
+            .map_err(|error| store_access_fault(self.pc, error))
+    }
+
+    fn write_u16(&mut self, bus: &mut Bus, address: u64, value: u16) -> Result<(), StepError> {
+        let physical = self.translate_address(bus, address, MemoryAccess::Store)?;
+        bus.write_u16(physical, value)
+            .map_err(|error| store_access_fault(self.pc, error))
+    }
+
+    fn write_u32(&mut self, bus: &mut Bus, address: u64, value: u32) -> Result<(), StepError> {
+        let physical = self.translate_address(bus, address, MemoryAccess::Store)?;
+        bus.write_u32(physical, value)
+            .map_err(|error| store_access_fault(self.pc, error))
+    }
+
+    fn write_u64(&mut self, bus: &mut Bus, address: u64, value: u64) -> Result<(), StepError> {
+        let physical = self.translate_address(bus, address, MemoryAccess::Store)?;
+        bus.write_u64(physical, value)
+            .map_err(|error| store_access_fault(self.pc, error))
+    }
+
+    fn translate_address(
+        &mut self,
+        bus: &mut Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<u64, StepError> {
+        let translation = self.translate_address_inner(bus, address, access)?;
+        if let Some((pte_address, pte)) = translation.pte_update {
+            bus.write_u64(pte_address, pte)
+                .map_err(|error| access_fault(self.pc, address, access, error))?;
+        }
+        Ok(translation.physical_address)
+    }
+
+    fn translate_address_inner(
+        &self,
+        bus: &Bus,
+        address: u64,
+        access: MemoryAccess,
+    ) -> Result<AddressTranslation, StepError> {
+        let mode = self.csrs.satp >> SATP_MODE_SHIFT;
+        if self.privilege_mode == PrivilegeMode::Machine || mode == SATP_MODE_BARE {
+            return Ok(AddressTranslation {
+                physical_address: address,
+                paging_active: false,
+                pte_update: None,
+            });
+        }
+        if mode != SATP_MODE_SV39 || !sv39_canonical(address) {
+            return Err(page_fault(self.pc, address, access));
+        }
+
+        let vpn = [
+            (address >> 12) & VPN_MASK,
+            (address >> 21) & VPN_MASK,
+            (address >> 30) & VPN_MASK,
+        ];
+        let mut table = (self.csrs.satp & SATP_PPN_MASK) << PAGE_SHIFT;
+        for level in (0..SV39_LEVELS).rev() {
+            let pte_address = table.wrapping_add(vpn[level].wrapping_mul(PTE_SIZE));
+            let pte = bus
+                .read_u64(pte_address)
+                .map_err(|error| access_fault(self.pc, address, access, error))?;
+            if pte & PTE_V == 0 || (pte & PTE_W != 0 && pte & PTE_R == 0) {
+                return Err(page_fault(self.pc, address, access));
+            }
+            if pte & (PTE_R | PTE_X) == 0 {
+                table = ((pte >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << PAGE_SHIFT;
+                continue;
+            }
+            if !pte_allows_access(pte, self.privilege_mode, access)
+                || !superpage_aligned(pte, level)
+            {
+                return Err(page_fault(self.pc, address, access));
+            }
+            let accessed_dirty = PTE_A
+                | if matches!(access, MemoryAccess::Store) {
+                    PTE_D
+                } else {
+                    0
+                };
+            return Ok(AddressTranslation {
+                physical_address: sv39_physical_address(pte, address, level),
+                paging_active: true,
+                pte_update: (pte & accessed_dirty != accessed_dirty)
+                    .then_some((pte_address, pte | accessed_dirty)),
+            });
+        }
+        Err(page_fault(self.pc, address, access))
     }
 
     fn clear_reservation_for_store(&mut self, address: u64) {
         if self.reservation == Some(address) {
             self.reservation = None;
         }
+    }
+}
+
+fn csr_accessible(address: u16, mode: PrivilegeMode) -> bool {
+    privilege_mode_rank(mode) >= u8::try_from((address >> 8) & 0b11).unwrap()
+}
+
+fn privilege_mode_rank(mode: PrivilegeMode) -> u8 {
+    match mode {
+        PrivilegeMode::User => 0,
+        PrivilegeMode::Supervisor => 1,
+        PrivilegeMode::Machine => 3,
     }
 }
 
@@ -933,6 +1293,14 @@ fn mpp_from_privilege_mode(mode: PrivilegeMode) -> u64 {
         PrivilegeMode::User => MSTATUS_MPP_USER,
         PrivilegeMode::Supervisor => MSTATUS_MPP_SUPERVISOR,
         PrivilegeMode::Machine => MSTATUS_MPP_MACHINE,
+    }
+}
+
+fn trap_cause_value(cause: u64, interrupt: bool) -> u64 {
+    if interrupt {
+        INTERRUPT_BIT | cause
+    } else {
+        cause
     }
 }
 
@@ -973,24 +1341,63 @@ fn store_access_fault(pc: u64, error: BusError) -> StepError {
     }
 }
 
-fn fetch_instruction(bus: &Bus, pc: u64) -> Result<Fetched, StepError> {
-    let half = bus
-        .read_u16(pc)
-        .map_err(|error| instruction_access_fault(pc, error))?;
-    if half & 0b11 == 0b11 {
-        Ok(Fetched {
-            raw: bus
-                .read_u32(pc)
-                .map_err(|error| instruction_access_fault(pc, error))?,
-            size: INSTRUCTION_SIZE,
-        })
-    } else {
-        let raw = decompress(half)
-            .map_err(|instruction| StepError::IllegalInstruction { pc, instruction })?;
-        Ok(Fetched {
-            raw,
-            size: COMPRESSED_INSTRUCTION_SIZE,
-        })
+fn access_fault(pc: u64, _address: u64, access: MemoryAccess, error: BusError) -> StepError {
+    match access {
+        MemoryAccess::Fetch => instruction_access_fault(pc, error),
+        MemoryAccess::Load => load_access_fault(pc, error),
+        MemoryAccess::Store => store_access_fault(pc, error),
+    }
+}
+
+fn page_fault(pc: u64, address: u64, access: MemoryAccess) -> StepError {
+    match access {
+        MemoryAccess::Fetch => StepError::InstructionPageFault { pc, address },
+        MemoryAccess::Load => StepError::LoadPageFault { pc, address },
+        MemoryAccess::Store => StepError::StorePageFault { pc, address },
+    }
+}
+
+fn sv39_canonical(address: u64) -> bool {
+    sign_extend_u64(address, SV39_VA_BITS) == address
+}
+
+fn pte_ppn(pte: u64, index: usize) -> u64 {
+    (pte >> (PTE_PPN_SHIFT + index as u64 * 9)) & VPN_MASK
+}
+
+fn pte_allows_access(pte: u64, mode: PrivilegeMode, access: MemoryAccess) -> bool {
+    if mode == PrivilegeMode::User && pte & PTE_U == 0 {
+        return false;
+    }
+    if mode == PrivilegeMode::Supervisor && pte & PTE_U != 0 {
+        return false;
+    }
+    match access {
+        MemoryAccess::Fetch => pte & PTE_X != 0,
+        MemoryAccess::Load => pte & PTE_R != 0,
+        MemoryAccess::Store => pte & (PTE_R | PTE_W) == PTE_R | PTE_W,
+    }
+}
+
+fn superpage_aligned(pte: u64, level: usize) -> bool {
+    (0..level).all(|index| pte_ppn(pte, index) == 0)
+}
+
+fn sv39_physical_address(pte: u64, address: u64, level: usize) -> u64 {
+    let ppn = (pte >> PTE_PPN_SHIFT) & PTE_PPN_MASK;
+    let page_offset = address & PAGE_OFFSET_MASK;
+    let vpn0 = (address >> 12) & VPN_MASK;
+    let vpn1 = (address >> 21) & VPN_MASK;
+    match level {
+        0 => (ppn << PAGE_SHIFT) | page_offset,
+        1 => (ppn & !VPN_MASK) << PAGE_SHIFT | (vpn0 << PAGE_SHIFT) | page_offset,
+        SV39_TOP_LEVEL => {
+            (ppn & !(VPN_MASK | (VPN_MASK << 9))) << PAGE_SHIFT
+                | (vpn1 << 21)
+                | (vpn0 << PAGE_SHIFT)
+                | page_offset
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -1405,6 +1812,8 @@ impl CsrFile {
             CSR_MVENDORID | CSR_MARCHID | CSR_MIMPID | CSR_MHARTID => Some(0),
             CSR_MSTATUS => Some(self.mstatus),
             CSR_MISA => Some(MISA_VALUE),
+            CSR_MEDELEG => Some(self.medeleg),
+            CSR_MIDELEG => Some(self.mideleg),
             CSR_MIE => Some(self.mie),
             CSR_MTVEC => Some(self.mtvec),
             CSR_MSCRATCH => Some(self.mscratch),
@@ -1412,6 +1821,15 @@ impl CsrFile {
             CSR_MCAUSE => Some(self.mcause),
             CSR_MTVAL => Some(self.mtval),
             CSR_MIP => Some(self.mip),
+            CSR_SSTATUS => Some(self.mstatus & SSTATUS_WRITABLE_MASK),
+            CSR_SIE => Some(self.mie & S_INTERRUPT_MASK),
+            CSR_STVEC => Some(self.stvec),
+            CSR_SSCRATCH => Some(self.sscratch),
+            CSR_SEPC => Some(self.sepc),
+            CSR_SCAUSE => Some(self.scause),
+            CSR_STVAL => Some(self.stval),
+            CSR_SIP => Some(self.mip & S_INTERRUPT_MASK),
+            CSR_SATP => Some(self.satp),
             CSR_CYCLE => Some(self.cycle),
             CSR_TIME => Some(self.cycle),
             CSR_INSTRET => Some(self.instret),
@@ -1422,6 +1840,8 @@ impl CsrFile {
     fn write(&mut self, address: u16, value: u64) -> Option<()> {
         match address {
             CSR_MSTATUS => self.mstatus = value & MSTATUS_WRITABLE_MASK,
+            CSR_MEDELEG => self.medeleg = value & MEDELEG_WRITABLE_MASK,
+            CSR_MIDELEG => self.mideleg = value & MIDELEG_WRITABLE_MASK,
             CSR_MIE => self.mie = value & MIE_WRITABLE_MASK,
             CSR_MTVEC => self.mtvec = value & MTVEC_WRITABLE_MASK,
             CSR_MSCRATCH => self.mscratch = value & MSCRATCH_WRITABLE_MASK,
@@ -1429,6 +1849,18 @@ impl CsrFile {
             CSR_MCAUSE => self.mcause = value & MCAUSE_WRITABLE_MASK,
             CSR_MTVAL => self.mtval = value & MTVAL_WRITABLE_MASK,
             CSR_MIP => self.mip = value & MIP_WRITABLE_MASK,
+            CSR_SSTATUS => {
+                self.mstatus =
+                    (self.mstatus & !SSTATUS_WRITABLE_MASK) | (value & SSTATUS_WRITABLE_MASK)
+            }
+            CSR_SIE => self.mie = (self.mie & !S_INTERRUPT_MASK) | (value & S_INTERRUPT_MASK),
+            CSR_STVEC => self.stvec = value & MTVEC_WRITABLE_MASK,
+            CSR_SSCRATCH => self.sscratch = value & MSCRATCH_WRITABLE_MASK,
+            CSR_SEPC => self.sepc = value & MEPC_WRITABLE_MASK,
+            CSR_SCAUSE => self.scause = value & MCAUSE_WRITABLE_MASK,
+            CSR_STVAL => self.stval = value & MTVAL_WRITABLE_MASK,
+            CSR_SIP => self.mip = (self.mip & !S_INTERRUPT_MASK) | (value & MIP_WRITABLE_MASK),
+            CSR_SATP => self.satp = write_satp(value),
             _ => return None,
         }
         Some(())
@@ -1451,6 +1883,16 @@ impl CsrFile {
     fn retire_instruction(&mut self) {
         self.cycle = self.cycle.wrapping_add(1);
         self.instret = self.instret.wrapping_add(1);
+    }
+}
+
+fn write_satp(value: u64) -> u64 {
+    match value >> SATP_MODE_SHIFT {
+        SATP_MODE_BARE => 0,
+        SATP_MODE_SV39 => {
+            value & ((SATP_MODE_SV39 << SATP_MODE_SHIFT) | SATP_ASID_MASK | SATP_PPN_MASK)
+        }
+        _ => 0,
     }
 }
 
@@ -1880,6 +2322,79 @@ mod tests {
     }
 
     #[test]
+    fn satp_accepts_sv39_and_rejects_unsupported_modes() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let sv39 = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | 0x1234;
+
+        cpu.csrs.write(CSR_SATP, sv39).unwrap();
+        assert_eq!(cpu.csr(CSR_SATP), sv39);
+
+        cpu.csrs.write(CSR_SATP, u64::MAX).unwrap();
+        assert_eq!(cpu.csr(CSR_SATP), 0);
+    }
+
+    #[test]
+    fn sv39_translates_supervisor_fetches_and_loads() {
+        let mut cpu = Cpu::new(0x1000);
+        let mut bus = Bus::new(0x8000);
+        let root = DRAM_START + 0x1000;
+        let level1 = DRAM_START + 0x2000;
+        let level0 = DRAM_START + 0x3000;
+        let data = DRAM_START + 0x4000;
+
+        install_sv39_table(&mut bus, root, level1, level0);
+        install_pte(&mut bus, level0, 1, DRAM_START, PTE_V | PTE_R | PTE_X);
+        install_pte(&mut bus, level0, 2, data, PTE_V | PTE_R);
+        bus.write_u32(
+            DRAM_START,
+            encode_i(0, 1, FUNCT_LOAD_DOUBLE, 5, OPCODE_LOAD),
+        )
+        .unwrap();
+        bus.write_u64(data, 0xfeed_face_cafe_beef).unwrap();
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
+        cpu.set_register(1, 0x2000);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(5), 0xfeed_face_cafe_beef);
+        assert_eq!(cpu.pc, 0x1000 + INSTRUCTION_SIZE);
+        assert_ne!(bus.read_u64(level0 + PTE_SIZE).unwrap() & PTE_A, 0);
+        assert_ne!(bus.read_u64(level0 + PTE_SIZE * 2).unwrap() & PTE_A, 0);
+    }
+
+    #[test]
+    fn sv39_load_page_fault_enters_trap_with_virtual_address() {
+        let mut cpu = Cpu::new(0x1000);
+        let mut bus = Bus::new(0x8000);
+        let root = DRAM_START + 0x1000;
+        let level1 = DRAM_START + 0x2000;
+        let level0 = DRAM_START + 0x3000;
+        let vector = DRAM_START + 0x5000;
+
+        install_sv39_table(&mut bus, root, level1, level0);
+        install_pte(&mut bus, level0, 1, DRAM_START, PTE_V | PTE_R | PTE_X);
+        bus.write_u32(
+            DRAM_START,
+            encode_i(0, 1, FUNCT_LOAD_DOUBLE, 5, OPCODE_LOAD),
+        )
+        .unwrap();
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
+        cpu.csrs.mtvec = vector;
+        cpu.set_register(1, 0x2000);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.privilege_mode(), PrivilegeMode::Machine);
+        assert_eq!(cpu.csr(CSR_MEPC), 0x1000);
+        assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_LOAD_PAGE_FAULT);
+        assert_eq!(cpu.csr(CSR_MTVAL), 0x2000);
+        assert_eq!(cpu.register(5), 0);
+    }
+
+    #[test]
     fn rv64a_lr_requires_zero_rs2() {
         let mut cpu = Cpu::new(DRAM_START);
         let mut bus = Bus::new(16);
@@ -2034,6 +2549,110 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MSTATUS), MSTATUS_WRITABLE_MASK);
         assert_eq!(cpu.csr(CSR_MTVEC), u64::MAX & MTVEC_WRITABLE_MASK);
         assert_eq!(cpu.csr(CSR_MEPC), u64::MAX & MEPC_WRITABLE_MASK);
+    }
+
+    #[test]
+    fn supervisor_csr_aliases_update_only_supervisor_state() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(32);
+        cpu.set_register(1, u64::MAX);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_SSTATUS), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE,
+            encode_csr(u32::from(CSR_SIE), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 2,
+            encode_csr(u32::from(CSR_SIP), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+        bus.write_u32(
+            DRAM_START + INSTRUCTION_SIZE * 3,
+            encode_csr(u32::from(CSR_SATP), FUNCT_CSRRW, 1, 0),
+        )
+        .unwrap();
+
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.csr(CSR_SSTATUS), SSTATUS_WRITABLE_MASK);
+        assert_eq!(cpu.csr(CSR_MSTATUS) & MSTATUS_MIE, 0);
+        assert_eq!(cpu.csr(CSR_SIE), S_INTERRUPT_MASK);
+        assert_eq!(cpu.csr(CSR_MIE), S_INTERRUPT_MASK);
+        assert_eq!(cpu.csr(CSR_SIP), S_INTERRUPT_MASK);
+        assert_eq!(cpu.csr(CSR_MIP), S_INTERRUPT_MASK);
+        assert_eq!(cpu.csr(CSR_SATP), 0);
+    }
+
+    #[test]
+    fn delegated_user_ecall_enters_supervisor_trap_vector() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        let vector = DRAM_START + 64;
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.csrs.stvec = vector;
+        cpu.csrs.medeleg = 1 << TRAP_ECALL_FROM_USER;
+        cpu.csrs.mstatus = MSTATUS_SIE;
+        bus.write_u32(DRAM_START, INSTRUCTION_ECALL).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.privilege_mode(), PrivilegeMode::Supervisor);
+        assert_eq!(cpu.csr(CSR_SEPC), DRAM_START);
+        assert_eq!(cpu.csr(CSR_SCAUSE), TRAP_ECALL_FROM_USER);
+        assert_eq!(cpu.csr(CSR_STVAL), 0);
+        assert_eq!(cpu.csr(CSR_SSTATUS) & MSTATUS_SIE, 0);
+        assert_ne!(cpu.csr(CSR_SSTATUS) & MSTATUS_SPIE, 0);
+        assert_eq!(cpu.csr(CSR_SSTATUS) & MSTATUS_SPP, 0);
+        assert_eq!(cpu.csr(CSR_MEPC), 0);
+        assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    #[test]
+    fn sret_restores_sepc_interrupt_enable_and_privilege_mode() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.sepc = DRAM_START + 8;
+        cpu.csrs.mstatus = MSTATUS_SPIE;
+        bus.write_u32(DRAM_START, INSTRUCTION_SRET).unwrap();
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.pc, DRAM_START + 8);
+        assert_eq!(cpu.privilege_mode(), PrivilegeMode::User);
+        assert_ne!(cpu.csr(CSR_SSTATUS) & MSTATUS_SIE, 0);
+        assert_ne!(cpu.csr(CSR_SSTATUS) & MSTATUS_SPIE, 0);
+        assert_eq!(cpu.csr(CSR_SSTATUS) & MSTATUS_SPP, 0);
+        assert_eq!(cpu.csr(CSR_INSTRET), 1);
+    }
+
+    #[test]
+    fn lower_privilege_machine_csr_access_traps_as_illegal() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(16);
+        let vector = DRAM_START + 8;
+        let instruction = encode_csr(u32::from(CSR_MSCRATCH), FUNCT_CSRRS, 0, 5);
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.mtvec = vector;
+        bus.write_u32(DRAM_START, instruction).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.privilege_mode(), PrivilegeMode::Machine);
+        assert_eq!(cpu.csr(CSR_MEPC), DRAM_START);
+        assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_ILLEGAL_INSTRUCTION);
+        assert_eq!(cpu.csr(CSR_MTVAL), u64::from(instruction));
+        assert_eq!(cpu.csr(CSR_INSTRET), 0);
     }
 
     #[test]
@@ -2254,7 +2873,7 @@ mod tests {
     fn unknown_csr_access_is_illegal() {
         let mut cpu = Cpu::new(DRAM_START);
         let mut bus = Bus::new(8);
-        let instruction = encode_csr(0x100, FUNCT_CSRRS, 0, 5);
+        let instruction = encode_csr(0x1ff, FUNCT_CSRRS, 0, 5);
         bus.write_u32(DRAM_START, instruction).unwrap();
 
         assert_illegal_instruction_trap(&mut cpu, &mut bus, instruction);
@@ -2270,6 +2889,16 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_ILLEGAL_INSTRUCTION);
         assert_eq!(cpu.csr(CSR_MTVAL), u64::from(instruction));
         assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    fn install_sv39_table(bus: &mut Bus, root: u64, level1: u64, level0: u64) {
+        install_pte(bus, root, 0, level1, PTE_V);
+        install_pte(bus, level1, 0, level0, PTE_V);
+    }
+
+    fn install_pte(bus: &mut Bus, table: u64, index: u64, physical: u64, flags: u64) {
+        let pte = ((physical >> PAGE_SHIFT) << PTE_PPN_SHIFT) | flags;
+        bus.write_u64(table + index * PTE_SIZE, pte).unwrap();
     }
 
     fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {

@@ -11,6 +11,8 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 - RV64C compressed integer, control-flow, and load/store instructions
 - Zicsr CSR read/write, set, and clear instructions
 - machine-mode trap entry for exceptions and `mret` trap return
+- supervisor-mode CSRs, delegated exception trap entry, and `sret` trap return
+- Sv39 page-table translation for supervisor and user instruction and data access
 - Zifencei instruction-fetch fence as a validated no-op
 - RV64 word operations with 32-bit sign extension
 - mixed 16-bit and 32-bit instruction fetch
@@ -80,9 +82,19 @@ Machine-software interrupt demo:
 cargo run -- --interactive demo/msip.bin
 ```
 
+Sv39 address-translation demo:
+
+```sh
+cargo run -- --interactive demo/sv39.bin
+```
+
+After the guest writes `satp` and enters supervisor mode, the TUI code pane
+renders translated fetches as `virtual -> physical`, and load/store/AMO previews
+show effective virtual addresses with their physical targets.
+
 Auto tests:
 ```sh
 cargo test
 ```
 
-Supervisor-mode CSRs, virtual memory, PLIC, virtio, and a real firmware/boot path are intentionally not here yet. They will come.
+PLIC, virtio, and a real firmware/boot path are intentionally not here yet. Full OS boot still needs more privilege and device work.

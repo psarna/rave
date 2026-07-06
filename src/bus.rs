@@ -345,12 +345,20 @@ impl Uart {
 
 fn clint_offset(address: u64, size: usize) -> Option<u64> {
     let end = address.checked_add(size as u64)?;
-    (address >= CLINT_START && end <= CLINT_START + CLINT_SIZE).then_some(address - CLINT_START)
+    if address >= CLINT_START && end <= CLINT_START + CLINT_SIZE {
+        Some(address - CLINT_START)
+    } else {
+        None
+    }
 }
 
 fn uart_offset(address: u64, size: usize) -> Option<u64> {
     let end = address.checked_add(size as u64)?;
-    (address >= UART_START && end <= UART_START + UART_SIZE).then_some(address - UART_START)
+    if address >= UART_START && end <= UART_START + UART_SIZE {
+        Some(address - UART_START)
+    } else {
+        None
+    }
 }
 
 fn register_contains(offset: u64, size: usize, register: u64, register_size: u64) -> bool {

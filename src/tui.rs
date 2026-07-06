@@ -1,4 +1,7 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -10,22 +13,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use rave::{
-    decode_compressed_instruction, encoded_instruction_size, Command, Debugger, Machine,
-    StopReason, REGISTER_NAMES,
+    decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
+    Machine, StopReason, REGISTER_NAMES,
 };
 use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
 const HELP: &str =
-    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | quit(q)";
+    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | PgUp/PgDown scroll | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const PC_INDEX: usize = 32;
 const MSIP_INDEX: usize = 33;
 const MTIME_INDEX: usize = 34;
 const MTIMECMP_INDEX: usize = 35;
+const SATP_INDEX: usize = 36;
 const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_INDEX;
 const LAST_EDITABLE_INDEX: usize = MTIMECMP_INDEX;
 const INSTRUCTION_SIZE: u64 = 4;
+const MOUSE_WHEEL_CODE_ROWS: i64 = 3;
 const PANEL_BORDER_HEIGHT: u16 = 2;
 const BRANCH_OPCODE: u32 = 0x63;
 const INSTRUCTION_ECALL: u32 = 0x0000_0073;
@@ -77,6 +82,7 @@ struct MemInfo {
     rs1: usize,
     offset: i64,
     address: u64,
+    physical_address: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +132,7 @@ struct AmoInfo {
     rs1: usize,
     rs2: usize,
     address: u64,
+    physical_address: Option<u64>,
     width: AmoWidth,
     old_value: Option<u64>,
     new_value: Option<u64>,
@@ -169,6 +176,8 @@ struct App {
     quit: bool,
     pending_exit: Option<(ExitChord, Instant)>,
     edit_history: Vec<RegisterEdit>,
+    code_scroll_rows: i64,
+    visible_code_rows: u64,
 }
 
 impl App {
@@ -184,6 +193,8 @@ impl App {
             quit: false,
             pending_exit: None,
             edit_history: Vec::new(),
+            code_scroll_rows: 0,
+            visible_code_rows: 1,
         }
     }
 }
@@ -199,10 +210,14 @@ pub fn run(image: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     while !app.quit {
         terminal.draw(|frame| draw(frame, &debugger, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(key, &mut debugger, &mut app);
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(mouse, &mut app);
+                }
+                _ => {}
             }
         }
     }
@@ -214,7 +229,7 @@ struct ScreenGuard;
 impl ScreenGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -222,7 +237,7 @@ impl ScreenGuard {
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -239,6 +254,11 @@ fn handle_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         confirm_exit(chord, app);
         return;
     }
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        let direction = if key.code == KeyCode::PageUp { -1 } else { 1 };
+        scroll_code_page(app, direction);
+        return;
+    }
     app.pending_exit = None;
 
     match app.mode {
@@ -247,6 +267,42 @@ fn handle_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         Mode::RegisterEdit => handle_edit_key(key, debugger, app),
         Mode::UartInput => handle_uart_input_key(key, debugger, app),
     }
+}
+
+fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => scroll_code_rows(app, -MOUSE_WHEEL_CODE_ROWS),
+        MouseEventKind::ScrollDown => scroll_code_rows(app, MOUSE_WHEEL_CODE_ROWS),
+        _ => {}
+    }
+}
+
+fn scroll_code_page(app: &mut App, direction: i64) {
+    let rows = app.visible_code_rows.saturating_sub(1).max(1);
+    scroll_code_rows(app, direction.saturating_mul(rows as i64));
+}
+
+fn scroll_code_rows(app: &mut App, rows: i64) {
+    app.code_scroll_rows = app.code_scroll_rows.saturating_add(rows);
+    app.status = if app.code_scroll_rows == 0 {
+        "code view centered on current instruction".into()
+    } else {
+        format!(
+            "code view offset by {} row(s); step, next, continue, or start to return to current",
+            app.code_scroll_rows
+        )
+    };
+}
+
+fn follow_current_code(app: &mut App) {
+    app.code_scroll_rows = 0;
+}
+
+fn command_recenters_code(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start | Command::Step | Command::Next | Command::Continue
+    )
 }
 
 fn handle_command_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
@@ -362,6 +418,7 @@ fn submit_uart_input(debugger: &mut Debugger, app: &mut App) {
             app.mode = Mode::Command;
             match debugger.continue_execution(Machine::INSTRUCTION_LIMIT) {
                 Ok(reason) => {
+                    follow_current_code(app);
                     app.status =
                         format!("queued {byte_count} UART byte(s); {}", format_stop(reason));
                     if reason == StopReason::UartInput {
@@ -409,14 +466,23 @@ fn execute_command(input: &str, debugger: &mut Debugger, app: &mut App) {
         Command::UartInput(input) => Some(format!("queued {} UART byte(s)", input.len() + 1)),
         _ => None,
     };
+    let recenter_code = command_recenters_code(&command);
     match debugger.execute(command, Machine::INSTRUCTION_LIMIT) {
         Ok(Some(reason)) => {
+            if recenter_code {
+                follow_current_code(app);
+            }
             app.status = format_stop(reason);
             if reason == StopReason::UartInput {
                 enter_uart_input(app);
             }
         }
-        Ok(None) => app.status = description.unwrap_or_else(|| "ok".into()),
+        Ok(None) => {
+            if recenter_code {
+                follow_current_code(app);
+            }
+            app.status = description.unwrap_or_else(|| "ok".into());
+        }
         Err(error) => app.status = error.to_string(),
     }
 }
@@ -459,7 +525,7 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(REGISTER_PANE_WIDTH)])
         .split(outer[0]);
-    draw_code(frame, body[0], debugger);
+    draw_code(frame, body[0], debugger, app);
     draw_right_column(frame, body[1], debugger, app);
     draw_uart(frame, outer[1], debugger);
     frame.render_widget(
@@ -471,13 +537,12 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
     draw_prompt(frame, outer[3], app);
 }
 
-fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
+fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut App) {
     let pc = debugger.machine.cpu.pc;
     let code_rows = visible_code_rows(area);
+    app.visible_code_rows = code_rows;
     let rows_before_pc = code_rows / 2;
-    let first = pc
-        .saturating_sub(INSTRUCTION_SIZE * rows_before_pc)
-        .wrapping_add(pc & 1);
+    let first = scrolled_code_start(pc, rows_before_pc, app.code_scroll_rows);
     let addresses = code_addresses(first, code_rows, debugger);
     let last = addresses.last().copied().unwrap_or(first);
     let current_flow = read_display_instruction(pc, debugger)
@@ -523,8 +588,23 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                     format!("{address:#018x}"),
                     base.patch(Style::default().fg(Color::Cyan)),
                 ),
-                Span::styled("  ", base),
             ];
+            if let Ok(translation) = debugger.machine.cpu.translate_address_for_debug(
+                &debugger.machine.bus,
+                address,
+                AddressAccess::Fetch,
+            ) {
+                if translation.paging_active {
+                    spans.extend([
+                        Span::styled(" -> ", base),
+                        Span::styled(
+                            format!("{:#018x}", translation.physical_address),
+                            base.patch(Style::default().fg(Color::LightCyan)),
+                        ),
+                    ]);
+                }
+            }
+            spans.push(Span::styled("  ", base));
             match read_display_instruction(address, debugger) {
                 Ok(display) => {
                     spans.push(Span::styled(
@@ -543,162 +623,169 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
                     let instruction = display.expanded;
                     if let Some(branch) = branch_info(instruction, address, debugger) {
                         spans.extend(branch_spans(&branch, base, debugger));
-                    } else {
-                        if let Some(jump) = decode_jump(instruction, address, debugger) {
-                            let rd_name = if jump.rd == 0 {
-                                "zero"
-                            } else {
-                                REGISTER_NAMES[jump.rd]
-                            };
+                    } else if let Some(jump) = decode_jump(instruction, address, debugger) {
+                        let rd_name = if jump.rd == 0 {
+                            "zero"
+                        } else {
+                            REGISTER_NAMES[jump.rd]
+                        };
+                        spans.extend([
+                            Span::styled(
+                                if jump.mnemonic == "jal" {
+                                    format!("{} {},", jump.mnemonic, rd_name)
+                                } else {
+                                    format!(
+                                        "{} {},{}({}) -> ",
+                                        jump.mnemonic,
+                                        rd_name,
+                                        i_immediate(instruction),
+                                        REGISTER_NAMES[jump.rs1]
+                                    )
+                                },
+                                base,
+                            ),
+                            Span::styled(
+                                format!("{:#018x}", jump.target),
+                                base.patch(Style::default().fg(Color::Cyan)),
+                            ),
+                        ]);
+                    } else if let Some(trap) = decode_trap_flow(instruction, debugger) {
+                        spans.extend(trap_flow_spans(&trap, base));
+                    } else if let Some(upper) = decode_upper(instruction, address) {
+                        let rd_name = if upper.rd == 0 {
+                            "zero"
+                        } else {
+                            REGISTER_NAMES[upper.rd]
+                        };
+                        spans.extend([
+                            Span::styled(format!("{} {},", upper.mnemonic, rd_name), base),
+                            Span::styled(
+                                format!("{:#x}", upper.immediate),
+                                base.patch(Style::default().fg(Color::Yellow)),
+                            ),
+                            Span::styled(" -> ", base),
+                            Span::styled(
+                                format!("{:#018x}", upper.result),
+                                base.patch(Style::default().fg(Color::Cyan)),
+                            ),
+                        ]);
+                    } else if let Some(misc) = decode_misc_mem(instruction) {
+                        spans.push(Span::styled(misc, base));
+                    } else if let Some(mem) = decode_mem(instruction, debugger) {
+                        let register_name = if mem.register == 0 {
+                            "zero"
+                        } else {
+                            REGISTER_NAMES[mem.register]
+                        };
+                        let base_val = debugger.machine.cpu.register(mem.rs1);
+                        spans.extend([
+                            Span::styled(
+                                format!(
+                                    "{} {},{}({}) [",
+                                    mem.mnemonic,
+                                    register_name,
+                                    mem.offset,
+                                    REGISTER_NAMES[mem.rs1]
+                                ),
+                                base,
+                            ),
+                            Span::styled(
+                                format!("{base_val:#x}"),
+                                base.patch(Style::default().fg(Color::Yellow)),
+                            ),
+                            Span::styled(format!(" + {}] @ ", mem.offset), base),
+                            Span::styled(
+                                format!("{:#018x}", mem.address),
+                                base.patch(Style::default().fg(Color::Cyan)),
+                            ),
+                        ]);
+                        if let Some(physical) = mem.physical_address {
                             spans.extend([
-                                Span::styled(
-                                    if jump.mnemonic == "jal" {
-                                        format!("{} {},", jump.mnemonic, rd_name)
-                                    } else {
-                                        format!(
-                                            "{} {},{}({}) -> ",
-                                            jump.mnemonic,
-                                            rd_name,
-                                            i_immediate(instruction),
-                                            REGISTER_NAMES[jump.rs1]
-                                        )
-                                    },
-                                    base,
-                                ),
-                                Span::styled(
-                                    format!("{:#018x}", jump.target),
-                                    base.patch(Style::default().fg(Color::Cyan)),
-                                ),
-                            ]);
-                        } else if let Some(trap) = decode_trap_flow(instruction, debugger) {
-                            spans.extend(trap_flow_spans(&trap, base));
-                        } else if let Some(upper) = decode_upper(instruction, address) {
-                            let rd_name = if upper.rd == 0 {
-                                "zero"
-                            } else {
-                                REGISTER_NAMES[upper.rd]
-                            };
-                            spans.extend([
-                                Span::styled(format!("{} {},", upper.mnemonic, rd_name), base),
-                                Span::styled(
-                                    format!("{:#x}", upper.immediate),
-                                    base.patch(Style::default().fg(Color::Yellow)),
-                                ),
                                 Span::styled(" -> ", base),
                                 Span::styled(
-                                    format!("{:#018x}", upper.result),
-                                    base.patch(Style::default().fg(Color::Cyan)),
+                                    format!("{physical:#018x}"),
+                                    base.patch(Style::default().fg(Color::LightCyan)),
                                 ),
                             ]);
-                        } else if let Some(misc) = decode_misc_mem(instruction) {
-                            spans.push(Span::styled(misc, base));
-                        } else if let Some(mem) = decode_mem(instruction, debugger) {
-                            let register_name = if mem.register == 0 {
-                                "zero"
-                            } else {
-                                REGISTER_NAMES[mem.register]
-                            };
-                            let base_val = debugger.machine.cpu.register(mem.rs1);
-                            spans.extend([
-                                Span::styled(
-                                    format!(
-                                        "{} {},{}({}) [",
-                                        mem.mnemonic,
-                                        register_name,
-                                        mem.offset,
-                                        REGISTER_NAMES[mem.rs1]
-                                    ),
-                                    base,
-                                ),
-                                Span::styled(
-                                    format!("{base_val:#x}"),
-                                    base.patch(Style::default().fg(Color::Yellow)),
-                                ),
-                                Span::styled(format!(" + {}] @ ", mem.offset), base),
-                                Span::styled(
-                                    format!("{:#018x}", mem.address),
-                                    base.patch(Style::default().fg(Color::Cyan)),
-                                ),
-                            ]);
-                        } else if let Some(amo) = decode_amo(instruction, debugger) {
-                            spans.extend(amo_spans(&amo, base));
-                        } else if let Some(alu) = decode_alu(instruction, debugger) {
-                            let rd_name = if alu.rd == 0 {
-                                "zero"
-                            } else {
-                                REGISTER_NAMES[alu.rd]
-                            };
-                            let lhs = debugger.machine.cpu.register(alu.rs1);
-                            let (rhs_name, rhs_value) = match alu.rhs {
-                                AluRhs::Register(rs2) => {
-                                    let val = debugger.machine.cpu.register(rs2);
-                                    (REGISTER_NAMES[rs2].to_string(), val)
-                                }
-                                AluRhs::Immediate(imm) => (imm.to_string(), imm as u64),
-                            };
-                            spans.extend([
-                                Span::styled(
-                                    format!(
-                                        "{} {},{},{} [",
-                                        alu.mnemonic, rd_name, REGISTER_NAMES[alu.rs1], rhs_name
-                                    ),
-                                    base,
-                                ),
-                                Span::styled(
-                                    format!("{lhs:#x}"),
-                                    base.patch(Style::default().fg(Color::Yellow)),
-                                ),
-                                Span::styled(format!(" {} ", alu.operator), base),
-                                Span::styled(
-                                    format!("{rhs_value:#x}"),
-                                    base.patch(Style::default().fg(Color::Yellow)),
-                                ),
-                                Span::styled("] -> ", base),
-                                Span::styled(
-                                    format!("{:#018x}", alu.result),
-                                    base.patch(Style::default().fg(Color::Cyan)),
-                                ),
-                            ]);
-                        } else if let Some(csr) = decode_csr(instruction, debugger) {
-                            let rd_name = if csr.rd == 0 {
-                                "zero"
-                            } else {
-                                REGISTER_NAMES[csr.rd]
-                            };
-                            let operand_name = match csr.operand {
-                                CsrOperand::Register(rs1) => REGISTER_NAMES[rs1].to_string(),
-                                CsrOperand::Immediate(value) => value.to_string(),
-                            };
-                            spans.extend([
-                                Span::styled(
-                                    format!(
-                                        "{} {},{},{} [old ",
-                                        csr.mnemonic,
-                                        rd_name,
-                                        csr_name(csr.csr),
-                                        operand_name
-                                    ),
-                                    base,
-                                ),
-                                Span::styled(
-                                    format!("{:#x}", csr.old_value),
-                                    base.patch(Style::default().fg(Color::Yellow)),
-                                ),
-                                Span::styled("] -> ", base),
-                                Span::styled(
-                                    format!("{}={:#018x}", rd_name, csr.old_value),
-                                    base.patch(Style::default().fg(Color::Cyan)),
-                                ),
-                            ]);
-                            if let Some(new_value) = csr.new_value {
-                                spans.extend([
-                                    Span::styled(", ", base),
-                                    Span::styled(
-                                        format!("{}={:#018x}", csr_name(csr.csr), new_value),
-                                        base.patch(Style::default().fg(Color::Cyan)),
-                                    ),
-                                ]);
+                        }
+                    } else if let Some(amo) = decode_amo(instruction, debugger) {
+                        spans.extend(amo_spans(&amo, base));
+                    } else if let Some(alu) = decode_alu(instruction, debugger) {
+                        let rd_name = if alu.rd == 0 {
+                            "zero"
+                        } else {
+                            REGISTER_NAMES[alu.rd]
+                        };
+                        let lhs = debugger.machine.cpu.register(alu.rs1);
+                        let (rhs_name, rhs_value) = match alu.rhs {
+                            AluRhs::Register(rs2) => {
+                                let val = debugger.machine.cpu.register(rs2);
+                                (REGISTER_NAMES[rs2].to_string(), val)
                             }
+                            AluRhs::Immediate(imm) => (imm.to_string(), imm as u64),
+                        };
+                        spans.extend([
+                            Span::styled(
+                                format!(
+                                    "{} {},{},{} [",
+                                    alu.mnemonic, rd_name, REGISTER_NAMES[alu.rs1], rhs_name
+                                ),
+                                base,
+                            ),
+                            Span::styled(
+                                format!("{lhs:#x}"),
+                                base.patch(Style::default().fg(Color::Yellow)),
+                            ),
+                            Span::styled(format!(" {} ", alu.operator), base),
+                            Span::styled(
+                                format!("{rhs_value:#x}"),
+                                base.patch(Style::default().fg(Color::Yellow)),
+                            ),
+                            Span::styled("] -> ", base),
+                            Span::styled(
+                                format!("{:#018x}", alu.result),
+                                base.patch(Style::default().fg(Color::Cyan)),
+                            ),
+                        ]);
+                    } else if let Some(csr) = decode_csr(instruction, debugger) {
+                        let rd_name = if csr.rd == 0 {
+                            "zero"
+                        } else {
+                            REGISTER_NAMES[csr.rd]
+                        };
+                        let operand_name = match csr.operand {
+                            CsrOperand::Register(rs1) => REGISTER_NAMES[rs1].to_string(),
+                            CsrOperand::Immediate(value) => value.to_string(),
+                        };
+                        spans.extend([
+                            Span::styled(
+                                format!(
+                                    "{} {},{},{} [old ",
+                                    csr.mnemonic,
+                                    rd_name,
+                                    csr_name(csr.csr),
+                                    operand_name
+                                ),
+                                base,
+                            ),
+                            Span::styled(
+                                format!("{:#x}", csr.old_value),
+                                base.patch(Style::default().fg(Color::Yellow)),
+                            ),
+                            Span::styled("] -> ", base),
+                            Span::styled(
+                                format!("{}={:#018x}", rd_name, csr.old_value),
+                                base.patch(Style::default().fg(Color::Cyan)),
+                            ),
+                        ]);
+                        if let Some(new_value) = csr.new_value {
+                            spans.extend([
+                                Span::styled(", ", base),
+                                Span::styled(
+                                    format!("{}={:#018x}", csr_name(csr.csr), new_value),
+                                    base.patch(Style::default().fg(Color::Cyan)),
+                                ),
+                            ]);
                         }
                     }
                 }
@@ -720,6 +807,18 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger) {
     );
 }
 
+fn scrolled_code_start(pc: u64, rows_before_pc: u64, scroll_rows: i64) -> u64 {
+    let centered = pc
+        .saturating_sub(INSTRUCTION_SIZE.saturating_mul(rows_before_pc))
+        .wrapping_add(pc & 1);
+    let scroll_bytes = INSTRUCTION_SIZE.saturating_mul(scroll_rows.unsigned_abs());
+    if scroll_rows < 0 {
+        centered.saturating_sub(scroll_bytes)
+    } else {
+        centered.wrapping_add(scroll_bytes)
+    }
+}
+
 struct DisplayInstruction {
     expanded: u32,
     encoding: String,
@@ -739,10 +838,16 @@ fn code_addresses(first: u64, rows: u64, debugger: &Debugger) -> Vec<u64> {
     let mut address = first & !1;
     for _ in 0..rows {
         addresses.push(address);
+        let physical = debugger
+            .machine
+            .cpu
+            .translate_address_for_debug(&debugger.machine.bus, address, AddressAccess::Fetch)
+            .map(|translation| translation.physical_address)
+            .unwrap_or(address);
         let size = debugger
             .machine
             .bus
-            .read_u16(address)
+            .read_u16(physical)
             .map(encoded_instruction_size)
             .unwrap_or(INSTRUCTION_SIZE);
         address = address.wrapping_add(size);
@@ -753,10 +858,15 @@ fn code_addresses(first: u64, rows: u64, debugger: &Debugger) -> Vec<u64> {
 fn read_display_instruction(
     address: u64,
     debugger: &Debugger,
-) -> Result<DisplayInstruction, rave::BusError> {
-    let half = debugger.machine.bus.read_u16(address)?;
+) -> Result<DisplayInstruction, Box<dyn std::error::Error>> {
+    let physical = debugger
+        .machine
+        .cpu
+        .translate_address_for_debug(&debugger.machine.bus, address, AddressAccess::Fetch)?
+        .physical_address;
+    let half = debugger.machine.bus.read_u16(physical)?;
     if encoded_instruction_size(half) == INSTRUCTION_SIZE {
-        let expanded = debugger.machine.bus.read_u32(address)?;
+        let expanded = debugger.machine.bus.read_u32(physical)?;
         Ok(DisplayInstruction {
             expanded,
             encoding: format!("{expanded:08x}"),
@@ -823,7 +933,7 @@ fn uart_output_text_lines(output: &[u8], max_lines: usize) -> Vec<String> {
 fn draw_right_column(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
         .split(area);
     draw_registers(frame, chunks[0], debugger, app);
     draw_pseudo_registers(frame, chunks[1], debugger, app);
@@ -840,8 +950,8 @@ fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &
 }
 
 fn draw_pseudo_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
-    let rows = (FIRST_PSEUDO_REGISTER_INDEX..=MTIMECMP_INDEX)
-        .map(|index| editable_row(debugger, app, index));
+    let rows =
+        (FIRST_PSEUDO_REGISTER_INDEX..=SATP_INDEX).map(|index| editable_row(debugger, app, index));
     let selected = (app.selected_register >= FIRST_PSEUDO_REGISTER_INDEX)
         .then(|| app.selected_register - FIRST_PSEUDO_REGISTER_INDEX);
     let mut state = TableState::default().with_selected(selected);
@@ -933,7 +1043,7 @@ fn pseudo_register_pane_title(app: &App) -> &'static str {
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (title, content) = match app.mode {
         Mode::Command => (
-            " Command [Enter repeats last; F5 continue, F10 next, F11 step] ",
+            " Command [Enter repeats last; F5 continue, F10 next, F11 step; PgUp/PgDown scroll] ",
             app.command.as_str(),
         ),
         Mode::RegisterSelect => (
@@ -962,6 +1072,7 @@ fn selected_value(debugger: &Debugger, index: usize) -> u64 {
         MSIP_INDEX => debugger.machine.bus.msip(),
         MTIME_INDEX => debugger.machine.bus.mtime(),
         MTIMECMP_INDEX => debugger.machine.bus.mtimecmp(),
+        SATP_INDEX => debugger.machine.cpu.csr(0x180),
         _ => debugger.machine.cpu.register(index),
     }
 }
@@ -972,6 +1083,7 @@ fn register_label(index: usize) -> String {
         MSIP_INDEX => "msip".into(),
         MTIME_INDEX => "mtime".into(),
         MTIMECMP_INDEX => "mtimecmp".into(),
+        SATP_INDEX => "satp".into(),
         _ => format!("x{index:<2} {}", REGISTER_NAMES[index]),
     }
 }
@@ -1353,6 +1465,21 @@ fn decode_mem(instruction: u32, debugger: &Debugger) -> Option<MemInfo> {
         )
     };
     let addr = base.wrapping_add(offset as u64);
+    let access = if opcode == 0x03 {
+        AddressAccess::Load
+    } else {
+        AddressAccess::Store
+    };
+    let physical_address = debugger
+        .machine
+        .cpu
+        .translate_address_for_debug(&debugger.machine.bus, addr, access)
+        .ok()
+        .and_then(|translation| {
+            translation
+                .paging_active
+                .then_some(translation.physical_address)
+        });
     let mnemonic = match (opcode, funct3) {
         (0x03, 0) => "lb",
         (0x03, 1) => "lh",
@@ -1373,6 +1500,7 @@ fn decode_mem(instruction: u32, debugger: &Debugger) -> Option<MemInfo> {
         rs1,
         offset,
         address: addr,
+        physical_address,
     })
 }
 
@@ -1410,14 +1538,33 @@ fn decode_amo(instruction: u32, debugger: &Debugger) -> Option<AmoInfo> {
     };
     let mnemonic = amo_mnemonic(operation, suffix)?;
     let address = debugger.machine.cpu.register(rs1);
+    let access = if operation == "lr" {
+        AddressAccess::Load
+    } else {
+        AddressAccess::Store
+    };
+    let translation = debugger
+        .machine
+        .cpu
+        .translate_address_for_debug(&debugger.machine.bus, address, access)
+        .ok();
+    let read_address = translation
+        .as_ref()
+        .map(|translation| translation.physical_address)
+        .unwrap_or(address);
+    let display_physical_address = translation.and_then(|translation| {
+        translation
+            .paging_active
+            .then_some(translation.physical_address)
+    });
     let old_value = match width {
         AmoWidth::Word => debugger
             .machine
             .bus
-            .read_u32(address)
+            .read_u32(read_address)
             .ok()
             .map(sign_extend_word),
-        AmoWidth::Double => debugger.machine.bus.read_u64(address).ok(),
+        AmoWidth::Double => debugger.machine.bus.read_u64(read_address).ok(),
     };
     let rhs = debugger.machine.cpu.register(rs2);
     let sc_success = (operation == "sc").then(|| debugger.machine.cpu.reservation_matches(address));
@@ -1433,6 +1580,7 @@ fn decode_amo(instruction: u32, debugger: &Debugger) -> Option<AmoInfo> {
         rs1,
         rs2,
         address,
+        physical_address: display_physical_address,
         width,
         old_value,
         new_value,
@@ -1528,6 +1676,15 @@ fn amo_spans<'a>(amo: &AmoInfo, base: Style) -> Vec<Span<'a>> {
         format!("{:#018x}", amo.address),
         base.patch(Style::default().fg(Color::Cyan)),
     ));
+    if let Some(physical) = amo.physical_address {
+        spans.extend([
+            Span::styled(" -> ", base),
+            Span::styled(
+                format!("{physical:#018x}"),
+                base.patch(Style::default().fg(Color::LightCyan)),
+            ),
+        ]);
+    }
     if let Some(old_value) = amo.old_value {
         spans.push(Span::styled(" [old ", base));
         spans.push(Span::styled(
@@ -1558,8 +1715,19 @@ fn amo_spans<'a>(amo: &AmoInfo, base: Style) -> Vec<Span<'a>> {
 
 fn csr_name(address: u16) -> String {
     match address {
+        0x100 => "sstatus".into(),
+        0x104 => "sie".into(),
+        0x105 => "stvec".into(),
+        0x140 => "sscratch".into(),
+        0x141 => "sepc".into(),
+        0x142 => "scause".into(),
+        0x143 => "stval".into(),
+        0x144 => "sip".into(),
+        0x180 => "satp".into(),
         0x300 => "mstatus".into(),
         0x301 => "misa".into(),
+        0x302 => "medeleg".into(),
+        0x303 => "mideleg".into(),
         0x304 => "mie".into(),
         0x305 => "mtvec".into(),
         0x340 => "mscratch".into(),
