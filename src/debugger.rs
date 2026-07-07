@@ -1,4 +1,5 @@
-use crate::{HaltReason, Machine, MachineError};
+use crate::cpu::{decode_compressed_instruction, encoded_instruction_size};
+use crate::{AddressAccess, HaltReason, Machine, MachineError};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
@@ -181,6 +182,63 @@ impl Debugger {
         }
     }
 
+    /// Steps one instruction, but treats calls (`jal`/`jalr` linking into
+    /// `ra` or `t0`) as a single step by running until the call returns.
+    pub fn next(&mut self, instruction_limit: u64) -> Result<StopReason, MachineError> {
+        let Some(return_address) = self.call_return_address() else {
+            return self.step();
+        };
+        let first = self.step()?;
+        if first != StopReason::Stepped {
+            return Ok(first);
+        }
+        for _ in 0..instruction_limit {
+            let pc = self.machine.cpu.pc;
+            if pc == return_address {
+                return Ok(StopReason::Stepped);
+            }
+            if self.breakpoints.contains(&pc) {
+                self.skip_current_breakpoint = true;
+                return Ok(StopReason::Breakpoint(pc));
+            }
+            if let Some(reason) = self.machine.step()? {
+                return Ok(StopReason::Halted(reason));
+            }
+            if self.should_stop_for_uart_input() {
+                return Ok(StopReason::UartInput);
+            }
+        }
+        Err(MachineError::InstructionLimit(instruction_limit))
+    }
+
+    /// Returns the sequential return address if the current instruction is a
+    /// call, or `None` if it is any other instruction (or unreadable).
+    fn call_return_address(&self) -> Option<u64> {
+        const OPCODE_MASK: u32 = 0x7f;
+        const OPCODE_JAL: u32 = 0x6f;
+        const OPCODE_JALR: u32 = 0x67;
+        const LINK_REGISTERS: [u32; 2] = [1, 5]; // ra, t0
+
+        let pc = self.machine.cpu.pc;
+        let physical = self
+            .machine
+            .cpu
+            .translate_address_for_debug(&self.machine.bus, pc, AddressAccess::Fetch)
+            .ok()?
+            .physical_address;
+        let half = self.machine.bus.read_u16(physical).ok()?;
+        let size = encoded_instruction_size(half);
+        let instruction = if size == 4 {
+            self.machine.bus.read_u32(physical).ok()?
+        } else {
+            decode_compressed_instruction(half)?
+        };
+        let opcode = instruction & OPCODE_MASK;
+        let rd = (instruction >> 7) & 0x1f;
+        let is_call = matches!(opcode, OPCODE_JAL | OPCODE_JALR) && LINK_REGISTERS.contains(&rd);
+        is_call.then(|| pc.wrapping_add(size))
+    }
+
     pub fn continue_execution(
         &mut self,
         instruction_limit: u64,
@@ -224,7 +282,8 @@ impl Debugger {
     ) -> Result<Option<StopReason>, MachineError> {
         match command {
             Command::Start => self.start().map(Some),
-            Command::Step | Command::Next => self.step().map(Some),
+            Command::Step => self.step().map(Some),
+            Command::Next => self.next(instruction_limit).map(Some),
             Command::Break(address) => {
                 self.breakpoints.insert(address);
                 Ok(None)
@@ -306,6 +365,33 @@ mod tests {
             debugger.continue_execution(10).unwrap(),
             StopReason::UartInput
         );
+    }
+
+    #[test]
+    fn next_steps_over_a_call_and_stops_after_it_returns() {
+        // jal ra, +8; ebreak; addi x1,x1,1; jalr x0, 0(ra)
+        let instructions = [
+            0x0080_00ef_u32, // jal ra, 8
+            0x0010_0073,     // ebreak
+            0x0013_0313,     // addi x6, x6, 1
+            0x0000_8067,     // ret
+        ];
+        let image: Vec<u8> = instructions
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut debugger = Debugger::new(&image, DRAM_START, 4096).unwrap();
+        assert_eq!(debugger.next(100).unwrap(), StopReason::Stepped);
+        assert_eq!(debugger.machine.cpu.pc, DRAM_START + 4);
+        assert_eq!(debugger.machine.cpu.register(6), 1);
+    }
+
+    #[test]
+    fn next_behaves_like_step_on_non_call_instructions() {
+        let mut debugger = debugger();
+        assert_eq!(debugger.next(100).unwrap(), StopReason::Stepped);
+        assert_eq!(debugger.machine.cpu.pc, DRAM_START + 4);
+        assert_eq!(debugger.machine.cpu.register(1), 1);
     }
 
     #[test]

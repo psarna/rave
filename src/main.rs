@@ -26,6 +26,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{USAGE}");
                 return Ok(());
             }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option: {other}\n{USAGE}").into())
+            }
             _ if path.is_none() => path = Some(argument),
             _ => return Err(USAGE.into()),
         }

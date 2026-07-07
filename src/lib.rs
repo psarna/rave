@@ -13,3 +13,12 @@ pub use debugger::{
     REGISTER_NAMES,
 };
 pub use machine::{Machine, MachineError};
+
+/// Shared instruction decoding/arithmetic helpers used by the TUI previews.
+#[doc(hidden)]
+pub mod decode_helpers {
+    pub use crate::cpu::{
+        b_immediate, div, divu, divuw, divw, i_immediate, j_immediate, mulh, mulhsu, mulhu, rem,
+        remu, remuw, remw, s_immediate, sign_extend_word, upper_immediate,
+    };
+}

@@ -12,6 +12,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
+use rave::decode_helpers::{
+    b_immediate, div, divu, divuw, divw, i_immediate, j_immediate, mulh, mulhsu, mulhu, rem, remu,
+    remuw, remw, s_immediate, sign_extend_word, upper_immediate,
+};
 use rave::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
     Machine, StopReason, REGISTER_NAMES,
@@ -36,8 +40,10 @@ const PANEL_BORDER_HEIGHT: u16 = 2;
 const BRANCH_OPCODE: u32 = 0x63;
 const INSTRUCTION_ECALL: u32 = 0x0000_0073;
 const INSTRUCTION_MRET: u32 = 0x3020_0073;
+const INSTRUCTION_SRET: u32 = 0x1020_0073;
 const CSR_MTVEC: u16 = 0x305;
 const CSR_MEPC: u16 = 0x341;
+const CSR_SEPC: u16 = 0x141;
 const REGISTER_NAME_WIDTH: u16 = 8;
 const REGISTER_VALUE_WIDTH: u16 = 18;
 const REGISTER_TABLE_DECORATION_WIDTH: u16 = 6;
@@ -1436,7 +1442,9 @@ fn set_value(debugger: &mut Debugger, index: usize, value: u64) {
         MSIP_INDEX => debugger.machine.bus.set_msip(value),
         MTIME_INDEX => debugger.machine.bus.set_mtime(value),
         MTIMECMP_INDEX => debugger.machine.bus.set_mtimecmp(value),
-        _ => debugger.machine.cpu.set_register(index, value),
+        SATP_INDEX => {} // read-only in the pane; never fall through to registers
+        _ if index < REGISTER_NAMES.len() => debugger.machine.cpu.set_register(index, value),
+        _ => {}
     }
 }
 
@@ -1472,6 +1480,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x73 if instruction == 0x0010_0073 => "ebreak",
         0x73 if instruction == 0x0000_0073 => "ecall",
         0x73 if instruction == 0x3020_0073 => "mret",
+        0x73 if instruction == 0x1020_0073 => "sret",
         0x73 => "system",
         _ => "unknown",
     }
@@ -1566,6 +1575,11 @@ fn decode_trap_flow(instruction: u32, debugger: &Debugger) -> Option<TrapFlowInf
             target_label: "mepc",
             target: debugger.machine.cpu.csr(CSR_MEPC),
         }),
+        INSTRUCTION_SRET => Some(TrapFlowInfo {
+            mnemonic: "sret",
+            target_label: "sepc",
+            target: debugger.machine.cpu.csr(CSR_SEPC),
+        }),
         _ => None,
     }
 }
@@ -1602,19 +1616,12 @@ fn branch_info(instruction: u32, address: u64, debugger: &Debugger) -> Option<Br
         mnemonic,
         rs1,
         rs2,
-        target: address.wrapping_add(branch_immediate(instruction) as u64),
+        target: address.wrapping_add(b_immediate(instruction) as u64),
         taken,
         operator,
     })
 }
 
-fn branch_immediate(instruction: u32) -> i64 {
-    let immediate = ((instruction >> 31) << 12)
-        | (((instruction >> 7) & 1) << 11)
-        | (((instruction >> 25) & 0x3f) << 5)
-        | (((instruction >> 8) & 0xf) << 1);
-    ((immediate << 19) as i32 >> 19) as i64
-}
 
 fn branch_spans<'a>(branch: &BranchInfo, base: Style, debugger: &Debugger) -> Vec<Span<'a>> {
     let lhs = debugger.machine.cpu.register(branch.rs1);
@@ -1673,27 +1680,9 @@ fn branch_arrow(address: u64, source: u64, target: u64, first: u64, last: u64) -
 }
 
 // Jump decoding helpers
-fn jal_immediate(instruction: u32) -> i64 {
-    let value = ((instruction >> 31) << 20)
-        | (((instruction >> 12) & 0xff) << 12)
-        | (((instruction >> 20) & 1) << 11)
-        | (((instruction >> 21) & 0x3ff) << 1);
-    ((value << 11) as i32 >> 11) as i64
-}
 
-fn i_immediate(instruction: u32) -> i64 {
-    let imm = (instruction >> 20) & 0xfff;
-    ((imm << 20) as i32 >> 20) as i64
-}
 
-fn s_immediate(instruction: u32) -> i64 {
-    let immediate = ((instruction >> 25) << 5) | ((instruction >> 7) & 0x1f);
-    ((immediate << 20) as i32 >> 20) as i64
-}
 
-fn upper_immediate(instruction: u32) -> u64 {
-    (instruction & 0xffff_f000) as i32 as i64 as u64
-}
 
 fn decode_upper(instruction: u32, address: u64) -> Option<UpperInfo> {
     let rd = ((instruction >> 7) & 0x1f) as usize;
@@ -1729,7 +1718,7 @@ fn decode_jump(instruction: u32, address: u64, debugger: &Debugger) -> Option<Ju
     let opcode = instruction & 0x7f;
     let rd = ((instruction >> 7) & 0x1f) as usize;
     if opcode == 0x6f {
-        let target = address.wrapping_add(jal_immediate(instruction) as u64);
+        let target = address.wrapping_add(j_immediate(instruction) as u64);
         Some(JumpInfo {
             mnemonic: "jal",
             rd,
@@ -2105,101 +2094,17 @@ fn decode_csr(instruction: u32, debugger: &Debugger) -> Option<CsrInfo> {
     })
 }
 
-fn sign_extend_word(value: u32) -> u64 {
-    value as i32 as i64 as u64
-}
 
-fn mulh(lhs: u64, rhs: u64) -> u64 {
-    (((lhs as i64 as i128) * (rhs as i64 as i128)) >> 64) as u64
-}
 
-fn mulhsu(lhs: u64, rhs: u64) -> u64 {
-    (((lhs as i64 as i128) * (rhs as u128 as i128)) >> 64) as u64
-}
 
-fn mulhu(lhs: u64, rhs: u64) -> u64 {
-    (((lhs as u128) * (rhs as u128)) >> 64) as u64
-}
 
-fn div(lhs: u64, rhs: u64) -> u64 {
-    let dividend = lhs as i64;
-    let divisor = rhs as i64;
-    if divisor == 0 {
-        u64::MAX
-    } else if dividend == i64::MIN && divisor == -1 {
-        lhs
-    } else {
-        dividend.wrapping_div(divisor) as u64
-    }
-}
 
-fn divu(lhs: u64, rhs: u64) -> u64 {
-    if rhs == 0 {
-        u64::MAX
-    } else {
-        lhs / rhs
-    }
-}
 
-fn rem(lhs: u64, rhs: u64) -> u64 {
-    let dividend = lhs as i64;
-    let divisor = rhs as i64;
-    if divisor == 0 {
-        lhs
-    } else if dividend == i64::MIN && divisor == -1 {
-        0
-    } else {
-        dividend.wrapping_rem(divisor) as u64
-    }
-}
 
-fn remu(lhs: u64, rhs: u64) -> u64 {
-    if rhs == 0 {
-        lhs
-    } else {
-        lhs % rhs
-    }
-}
 
-fn divw(lhs: u32, rhs: u32) -> u32 {
-    let dividend = lhs as i32;
-    let divisor = rhs as i32;
-    if divisor == 0 {
-        u32::MAX
-    } else if dividend == i32::MIN && divisor == -1 {
-        lhs
-    } else {
-        dividend.wrapping_div(divisor) as u32
-    }
-}
 
-fn divuw(lhs: u32, rhs: u32) -> u32 {
-    if rhs == 0 {
-        u32::MAX
-    } else {
-        lhs / rhs
-    }
-}
 
-fn remw(lhs: u32, rhs: u32) -> u32 {
-    let dividend = lhs as i32;
-    let divisor = rhs as i32;
-    if divisor == 0 {
-        lhs
-    } else if dividend == i32::MIN && divisor == -1 {
-        0
-    } else {
-        dividend.wrapping_rem(divisor) as u32
-    }
-}
 
-fn remuw(lhs: u32, rhs: u32) -> u32 {
-    if rhs == 0 {
-        lhs
-    } else {
-        lhs % rhs
-    }
-}
 
 fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
     let opcode = instruction & 0x7f;

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::VecDeque, fmt};
+use std::{collections::VecDeque, fmt};
 
 pub const ROM_START: u64 = 0x0000_1000;
 pub const ROM_SIZE: u64 = 0x0000_f000;
@@ -83,8 +83,8 @@ struct Clint {
 #[derive(Default)]
 struct Uart {
     output: Vec<u8>,
-    input: RefCell<VecDeque<u8>>,
-    waiting_for_input: RefCell<bool>,
+    input: VecDeque<u8>,
+    waiting_for_input: bool,
 }
 
 impl Bus {
@@ -107,15 +107,15 @@ impl Bus {
         &self.uart.output
     }
 
-    pub fn push_uart_input(&self, input: &[u8]) {
-        self.uart.input.borrow_mut().extend(input);
+    pub fn push_uart_input(&mut self, input: &[u8]) {
+        self.uart.input.extend(input);
         if !input.is_empty() {
-            self.uart.waiting_for_input.replace(false);
+            self.uart.waiting_for_input = false;
         }
     }
 
-    pub fn take_uart_input_wait(&self) -> bool {
-        self.uart.waiting_for_input.replace(false)
+    pub fn take_uart_input_wait(&mut self) -> bool {
+        std::mem::replace(&mut self.uart.waiting_for_input, false)
     }
 
     pub fn load_dram(&mut self, address: u64, data: &[u8]) -> Result<(), BusError> {
@@ -160,12 +160,24 @@ impl Bus {
         self.clint.mtimecmp = value;
     }
 
-    pub fn read_u8(&self, address: u64) -> Result<u8, BusError> {
+    pub fn read_u8(&mut self, address: u64) -> Result<u8, BusError> {
         if let Some(offset) = clint_offset(address, 1) {
             return Ok(self.clint.read(offset, 1)? as u8);
         }
         if let Some(offset) = uart_offset(address, 1) {
             return Ok(self.uart.read(offset));
+        }
+        Ok(self.dram[self.dram_range(address, 1)?.start])
+    }
+
+    /// Side-effect-free variant of [`Bus::read_u8`] for debugger previews:
+    /// device reads (e.g. the UART receive buffer) do not consume state.
+    pub fn peek_u8(&self, address: u64) -> Result<u8, BusError> {
+        if let Some(offset) = clint_offset(address, 1) {
+            return Ok(self.clint.read(offset, 1)? as u8);
+        }
+        if let Some(offset) = uart_offset(address, 1) {
+            return Ok(self.uart.peek(offset));
         }
         Ok(self.dram[self.dram_range(address, 1)?.start])
     }
@@ -315,25 +327,39 @@ impl Uart {
     const LINE_STATUS_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 5;
     const LINE_STATUS_TRANSMITTER_EMPTY: u8 = 1 << 6;
 
-    fn read(&self, offset: u64) -> u8 {
+    fn read(&mut self, offset: u64) -> u8 {
         match offset {
             Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => {
-                let value = self.input.borrow_mut().pop_front();
-                self.waiting_for_input.replace(value.is_none());
+                let value = self.input.pop_front();
+                self.waiting_for_input = value.is_none();
                 value.unwrap_or(0)
             }
             Self::LINE_STATUS => {
-                let mut status =
-                    Self::LINE_STATUS_TRANSMIT_HOLDING_EMPTY | Self::LINE_STATUS_TRANSMITTER_EMPTY;
-                let has_input = !self.input.borrow().is_empty();
-                if has_input {
-                    status |= Self::LINE_STATUS_DATA_READY;
-                }
-                self.waiting_for_input.replace(!has_input);
-                status
+                let has_input = !self.input.is_empty();
+                self.waiting_for_input = !has_input;
+                Self::line_status(has_input)
             }
             _ => 0,
         }
+    }
+
+    fn peek(&self, offset: u64) -> u8 {
+        match offset {
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => {
+                self.input.front().copied().unwrap_or(0)
+            }
+            Self::LINE_STATUS => Self::line_status(!self.input.is_empty()),
+            _ => 0,
+        }
+    }
+
+    fn line_status(has_input: bool) -> u8 {
+        let mut status =
+            Self::LINE_STATUS_TRANSMIT_HOLDING_EMPTY | Self::LINE_STATUS_TRANSMITTER_EMPTY;
+        if has_input {
+            status |= Self::LINE_STATUS_DATA_READY;
+        }
+        status
     }
 
     fn write(&mut self, offset: u64, value: u8) {
@@ -465,8 +491,18 @@ mod tests {
     }
 
     #[test]
+    fn uart_peek_does_not_consume_input() {
+        let mut bus = Bus::new(16);
+        bus.push_uart_input(b"A");
+        assert_eq!(bus.peek_u8(UART_START), Ok(b'A'));
+        assert_eq!(bus.peek_u8(UART_START + 5), Ok(0x61));
+        assert_eq!(bus.read_u8(UART_START), Ok(b'A'));
+        assert_eq!(bus.peek_u8(UART_START + 5), Ok(0x60));
+    }
+
+    #[test]
     fn uart_receiver_buffer_pops_input_bytes() {
-        let bus = Bus::new(16);
+        let mut bus = Bus::new(16);
         bus.push_uart_input(b"AZ");
         assert_eq!(bus.read_u8(UART_START + 5), Ok(0x61));
         assert_eq!(bus.read_u8(UART_START), Ok(b'A'));

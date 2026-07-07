@@ -153,6 +153,7 @@ const MSTATUS_MPP_SHIFT: u64 = 11;
 const MSTATUS_MPP_MASK: u64 = 0b11 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_USER: u64 = 0b00 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_SUPERVISOR: u64 = 0b01 << MSTATUS_MPP_SHIFT;
+const MSTATUS_MPP_RESERVED: u64 = 0b10 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_MACHINE: u64 = 0b11 << MSTATUS_MPP_SHIFT;
 const SSTATUS_WRITABLE_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
 const MSTATUS_WRITABLE_MASK: u64 =
@@ -1106,10 +1107,15 @@ impl Cpu {
             .read_u16(physical_pc)
             .map_err(|error| instruction_access_fault(pc, error))?;
         if half & 0b11 == 0b11 {
+            // The upper half may live on a different page, so translate it
+            // separately instead of assuming physical contiguity.
+            let upper_pc = pc.wrapping_add(COMPRESSED_INSTRUCTION_SIZE);
+            let physical_upper = self.translate_address(bus, upper_pc, MemoryAccess::Fetch)?;
+            let upper = bus
+                .read_u16(physical_upper)
+                .map_err(|error| instruction_access_fault(pc, error))?;
             Ok(Fetched {
-                raw: bus
-                    .read_u32(physical_pc)
-                    .map_err(|error| instruction_access_fault(pc, error))?,
+                raw: u32::from(half) | (u32::from(upper) << 16),
                 size: INSTRUCTION_SIZE,
             })
         } else {
@@ -1687,7 +1693,7 @@ fn c_addi4spn_immediate(raw: u32) -> u32 {
 }
 
 fn c_lw_immediate(raw: u32) -> u32 {
-    (((raw >> 10) & 0x7) << 3) | (((raw >> 6) & 1) << 2)
+    (((raw >> 10) & 0x7) << 3) | (((raw >> 6) & 1) << 2) | (((raw >> 5) & 1) << 6)
 }
 
 fn c_ld_immediate(raw: u32) -> u32 {
@@ -1839,7 +1845,7 @@ impl CsrFile {
 
     fn write(&mut self, address: u16, value: u64) -> Option<()> {
         match address {
-            CSR_MSTATUS => self.mstatus = value & MSTATUS_WRITABLE_MASK,
+            CSR_MSTATUS => self.mstatus = legalize_mstatus(self.mstatus, value),
             CSR_MEDELEG => self.medeleg = value & MEDELEG_WRITABLE_MASK,
             CSR_MIDELEG => self.mideleg = value & MIDELEG_WRITABLE_MASK,
             CSR_MIE => self.mie = value & MIE_WRITABLE_MASK,
@@ -1886,6 +1892,15 @@ impl CsrFile {
     }
 }
 
+fn legalize_mstatus(previous: u64, value: u64) -> u64 {
+    let mut next = value & MSTATUS_WRITABLE_MASK;
+    // MPP is a WARL field; 0b10 is reserved, so retain the previous value.
+    if next & MSTATUS_MPP_MASK == MSTATUS_MPP_RESERVED {
+        next = (next & !MSTATUS_MPP_MASK) | (previous & MSTATUS_MPP_MASK);
+    }
+    next
+}
+
 fn write_satp(value: u64) -> u64 {
     match value >> SATP_MODE_SHIFT {
         SATP_MODE_BARE => 0,
@@ -1908,23 +1923,28 @@ fn sign_extend_u64(value: u64, bits: u32) -> u64 {
     ((value << (XLEN_BITS - bits)) as i64 >> (XLEN_BITS - bits)) as u64
 }
 
-fn sign_extend_word(value: u32) -> u64 {
+#[doc(hidden)]
+pub fn sign_extend_word(value: u32) -> u64 {
     value as i32 as i64 as u64
 }
 
-fn mulh(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn mulh(lhs: u64, rhs: u64) -> u64 {
     (((lhs as i64 as i128) * (rhs as i64 as i128)) >> XLEN_BITS) as u64
 }
 
-fn mulhsu(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn mulhsu(lhs: u64, rhs: u64) -> u64 {
     (((lhs as i64 as i128) * (rhs as u128 as i128)) >> XLEN_BITS) as u64
 }
 
-fn mulhu(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn mulhu(lhs: u64, rhs: u64) -> u64 {
     (((lhs as u128) * (rhs as u128)) >> XLEN_BITS) as u64
 }
 
-fn div(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn div(lhs: u64, rhs: u64) -> u64 {
     let dividend = lhs as i64;
     let divisor = rhs as i64;
     if divisor == 0 {
@@ -1936,7 +1956,8 @@ fn div(lhs: u64, rhs: u64) -> u64 {
     }
 }
 
-fn divu(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn divu(lhs: u64, rhs: u64) -> u64 {
     if rhs == 0 {
         u64::MAX
     } else {
@@ -1944,7 +1965,8 @@ fn divu(lhs: u64, rhs: u64) -> u64 {
     }
 }
 
-fn rem(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn rem(lhs: u64, rhs: u64) -> u64 {
     let dividend = lhs as i64;
     let divisor = rhs as i64;
     if divisor == 0 {
@@ -1956,7 +1978,8 @@ fn rem(lhs: u64, rhs: u64) -> u64 {
     }
 }
 
-fn remu(lhs: u64, rhs: u64) -> u64 {
+#[doc(hidden)]
+pub fn remu(lhs: u64, rhs: u64) -> u64 {
     if rhs == 0 {
         lhs
     } else {
@@ -1964,7 +1987,8 @@ fn remu(lhs: u64, rhs: u64) -> u64 {
     }
 }
 
-fn divw(lhs: u32, rhs: u32) -> u32 {
+#[doc(hidden)]
+pub fn divw(lhs: u32, rhs: u32) -> u32 {
     let dividend = lhs as i32;
     let divisor = rhs as i32;
     if divisor == 0 {
@@ -1976,7 +2000,8 @@ fn divw(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
-fn divuw(lhs: u32, rhs: u32) -> u32 {
+#[doc(hidden)]
+pub fn divuw(lhs: u32, rhs: u32) -> u32 {
     if rhs == 0 {
         u32::MAX
     } else {
@@ -1984,7 +2009,8 @@ fn divuw(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
-fn remw(lhs: u32, rhs: u32) -> u32 {
+#[doc(hidden)]
+pub fn remw(lhs: u32, rhs: u32) -> u32 {
     let dividend = lhs as i32;
     let divisor = rhs as i32;
     if divisor == 0 {
@@ -1996,7 +2022,8 @@ fn remw(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
-fn remuw(lhs: u32, rhs: u32) -> u32 {
+#[doc(hidden)]
+pub fn remuw(lhs: u32, rhs: u32) -> u32 {
     if rhs == 0 {
         lhs
     } else {
@@ -2004,27 +2031,31 @@ fn remuw(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
-fn upper_immediate(instruction: u32) -> u64 {
+#[doc(hidden)]
+pub fn upper_immediate(instruction: u32) -> u64 {
     sign_extend_u64(
         (instruction & UPPER_IMMEDIATE_MASK) as u64,
         U_IMMEDIATE_BITS,
     )
 }
 
-fn i_immediate(instruction: u32) -> i64 {
+#[doc(hidden)]
+pub fn i_immediate(instruction: u32) -> i64 {
     sign_extend(
         bits(instruction, I_IMMEDIATE_SHIFT, I_IMMEDIATE_BITS),
         I_IMMEDIATE_BITS,
     )
 }
 
-fn s_immediate(instruction: u32) -> i64 {
+#[doc(hidden)]
+pub fn s_immediate(instruction: u32) -> i64 {
     let low = bits(instruction, S_IMMEDIATE_LOW_SHIFT, S_IMMEDIATE_LOW_BITS);
     let high = bits(instruction, S_IMMEDIATE_HIGH_SHIFT, S_IMMEDIATE_HIGH_BITS);
     sign_extend((high << S_IMMEDIATE_LOW_BITS) | low, I_IMMEDIATE_BITS)
 }
 
-fn b_immediate(instruction: u32) -> i64 {
+#[doc(hidden)]
+pub fn b_immediate(instruction: u32) -> i64 {
     let value = ((instruction >> 31) << 12)
         | (((instruction >> 7) & 1) << 11)
         | (((instruction >> 25) & 0x3f) << 5)
@@ -2032,7 +2063,8 @@ fn b_immediate(instruction: u32) -> i64 {
     sign_extend(value, B_IMMEDIATE_BITS)
 }
 
-fn j_immediate(instruction: u32) -> i64 {
+#[doc(hidden)]
+pub fn j_immediate(instruction: u32) -> i64 {
     let value = ((instruction >> 31) << 20)
         | (((instruction >> 12) & 0xff) << 12)
         | (((instruction >> 20) & 1) << 11)
@@ -2671,6 +2703,67 @@ mod tests {
         assert_eq!(
             cpu.step(&mut bus),
             Ok(Some(HaltReason::Breakpoint { code: 0 }))
+        );
+    }
+
+    #[test]
+    fn compressed_lw_and_sw_support_offsets_of_64_and_above() {
+        // c.lw a0, 64(a1): offset[6] comes from instruction bit 5.
+        // funct3=010, imm[5:3]=000 (bits 12:10), rs1'=a1(3), imm[2]=0, imm[6]=1, rd'=a0(2)
+        #[allow(clippy::unusual_byte_groupings)] // grouped by encoding fields
+        let c_lw = 0b010_000_011_0_1_010_00;
+        assert_eq!(
+            decode_compressed_instruction(c_lw),
+            Some(encode_i(64, 11, FUNCT_LOAD_WORD, 10, OPCODE_LOAD))
+        );
+        // c.sw a0, 64(a1)
+        #[allow(clippy::unusual_byte_groupings)]
+        let c_sw = 0b110_000_011_0_1_010_00;
+        assert_eq!(
+            decode_compressed_instruction(c_sw),
+            Some(encode_s(64, 10, 11, FUNCT_STORE_WORD))
+        );
+    }
+
+    #[test]
+    fn fetch_translates_each_half_of_a_page_straddling_instruction() {
+        // Map virtual pages 1 and 2 to non-contiguous physical pages, place a
+        // 4-byte instruction across the boundary, and check both halves come
+        // from their own mappings.
+        let mut cpu = Cpu::new(0x1000 + PAGE_SIZE - 2);
+        let mut bus = Bus::new(0x10000);
+        let root = DRAM_START + 0x1000;
+        let level1 = DRAM_START + 0x2000;
+        let level0 = DRAM_START + 0x3000;
+        let low_page = DRAM_START + 0x4000;
+        let high_page = DRAM_START + 0x6000;
+
+        install_sv39_table(&mut bus, root, level1, level0);
+        install_pte(&mut bus, level0, 1, low_page, PTE_V | PTE_R | PTE_X);
+        install_pte(&mut bus, level0, 2, high_page, PTE_V | PTE_R | PTE_X);
+
+        let instruction = 0x0010_0093_u32; // addi x1, x0, 1
+        bus.write_u16(low_page + PAGE_SIZE - 2, instruction as u16)
+            .unwrap();
+        bus.write_u16(high_page, (instruction >> 16) as u16).unwrap();
+
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.register(1), 1);
+        assert_eq!(cpu.pc, 0x1000 + PAGE_SIZE + 2);
+    }
+
+    #[test]
+    fn mstatus_rejects_reserved_mpp_encoding() {
+        let mut cpu = Cpu::new(DRAM_START);
+        cpu.csrs.write(CSR_MSTATUS, MSTATUS_MPP_SUPERVISOR).unwrap();
+        cpu.csrs.write(CSR_MSTATUS, MSTATUS_MPP_RESERVED).unwrap();
+        assert_eq!(
+            cpu.csr(CSR_MSTATUS) & MSTATUS_MPP_MASK,
+            MSTATUS_MPP_SUPERVISOR
         );
     }
 
