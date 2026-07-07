@@ -226,10 +226,10 @@ impl Debugger {
             .translate_address_for_debug(&self.machine.bus, pc, AddressAccess::Fetch)
             .ok()?
             .physical_address;
-        let half = self.machine.bus.read_u16(physical).ok()?;
+        let half = self.machine.bus.peek_u16(physical).ok()?;
         let size = encoded_instruction_size(half);
         let instruction = if size == 4 {
-            self.machine.bus.read_u32(physical).ok()?
+            self.machine.bus.peek_u32(physical).ok()?
         } else {
             decode_compressed_instruction(half)?
         };

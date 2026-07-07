@@ -182,7 +182,10 @@ impl Bus {
         Ok(self.dram[self.dram_range(address, 1)?.start])
     }
 
-    pub fn read_u16(&self, address: u64) -> Result<u16, BusError> {
+    pub fn read_u16(&mut self, address: u64) -> Result<u16, BusError> {
+        if uart_offset(address, 2).is_some() {
+            return Ok(self.read_uart_le(address, 2) as u16);
+        }
         if let Some(offset) = clint_offset(address, 2) {
             return Ok(self.clint.read(offset, 2)? as u16);
         }
@@ -190,7 +193,10 @@ impl Bus {
         Ok(u16::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
 
-    pub fn read_u32(&self, address: u64) -> Result<u32, BusError> {
+    pub fn read_u32(&mut self, address: u64) -> Result<u32, BusError> {
+        if uart_offset(address, 4).is_some() {
+            return Ok(self.read_uart_le(address, 4) as u32);
+        }
         if let Some(offset) = clint_offset(address, 4) {
             return Ok(self.clint.read(offset, 4)? as u32);
         }
@@ -198,7 +204,44 @@ impl Bus {
         Ok(u32::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
 
-    pub fn read_u64(&self, address: u64) -> Result<u64, BusError> {
+    pub fn read_u64(&mut self, address: u64) -> Result<u64, BusError> {
+        if uart_offset(address, 8).is_some() {
+            return Ok(self.read_uart_le(address, 8));
+        }
+        if let Some(offset) = clint_offset(address, 8) {
+            return self.clint.read(offset, 8);
+        }
+        let range = self.dram_range(address, 8)?;
+        Ok(u64::from_le_bytes(self.dram[range].try_into().unwrap()))
+    }
+
+    /// Side-effect-free variants of the read methods for debugger previews.
+    pub fn peek_u16(&self, address: u64) -> Result<u16, BusError> {
+        if uart_offset(address, 2).is_some() {
+            return Ok(self.peek_uart_le(address, 2) as u16);
+        }
+        if let Some(offset) = clint_offset(address, 2) {
+            return Ok(self.clint.read(offset, 2)? as u16);
+        }
+        let range = self.dram_range(address, 2)?;
+        Ok(u16::from_le_bytes(self.dram[range].try_into().unwrap()))
+    }
+
+    pub fn peek_u32(&self, address: u64) -> Result<u32, BusError> {
+        if uart_offset(address, 4).is_some() {
+            return Ok(self.peek_uart_le(address, 4) as u32);
+        }
+        if let Some(offset) = clint_offset(address, 4) {
+            return Ok(self.clint.read(offset, 4)? as u32);
+        }
+        let range = self.dram_range(address, 4)?;
+        Ok(u32::from_le_bytes(self.dram[range].try_into().unwrap()))
+    }
+
+    pub fn peek_u64(&self, address: u64) -> Result<u64, BusError> {
+        if uart_offset(address, 8).is_some() {
+            return Ok(self.peek_uart_le(address, 8));
+        }
         if let Some(offset) = clint_offset(address, 8) {
             return self.clint.read(offset, 8);
         }
@@ -221,6 +264,10 @@ impl Bus {
     }
 
     pub fn write_u16(&mut self, address: u64, value: u16) -> Result<(), BusError> {
+        if uart_offset(address, 2).is_some() {
+            self.write_uart_le(address, u64::from(value), 2);
+            return Ok(());
+        }
         if let Some(offset) = clint_offset(address, 2) {
             self.clint.write(offset, 2, u64::from(value))?;
             return Ok(());
@@ -231,6 +278,10 @@ impl Bus {
     }
 
     pub fn write_u32(&mut self, address: u64, value: u32) -> Result<(), BusError> {
+        if uart_offset(address, 4).is_some() {
+            self.write_uart_le(address, u64::from(value), 4);
+            return Ok(());
+        }
         if let Some(offset) = clint_offset(address, 4) {
             self.clint.write(offset, 4, u64::from(value))?;
             return Ok(());
@@ -241,6 +292,10 @@ impl Bus {
     }
 
     pub fn write_u64(&mut self, address: u64, value: u64) -> Result<(), BusError> {
+        if uart_offset(address, 8).is_some() {
+            self.write_uart_le(address, value, 8);
+            return Ok(());
+        }
         if let Some(offset) = clint_offset(address, 8) {
             self.clint.write(offset, 8, value)?;
             return Ok(());
@@ -248,6 +303,33 @@ impl Bus {
         let range = self.dram_range(address, 8)?;
         self.dram[range].copy_from_slice(&value.to_le_bytes());
         Ok(())
+    }
+
+    /// Reads a little-endian value from the UART window one byte at a time,
+    /// so wide accesses see the same registers as byte accesses.
+    fn read_uart_le(&mut self, address: u64, size: usize) -> u64 {
+        let mut value = 0u64;
+        for index in 0..size {
+            let offset = address + index as u64 - UART_START;
+            value |= u64::from(self.uart.read(offset)) << (index * 8);
+        }
+        value
+    }
+
+    fn peek_uart_le(&self, address: u64, size: usize) -> u64 {
+        let mut value = 0u64;
+        for index in 0..size {
+            let offset = address + index as u64 - UART_START;
+            value |= u64::from(self.uart.peek(offset)) << (index * 8);
+        }
+        value
+    }
+
+    fn write_uart_le(&mut self, address: u64, value: u64, size: usize) {
+        for index in 0..size {
+            let offset = address + index as u64 - UART_START;
+            self.uart.write(offset, (value >> (index * 8)) as u8);
+        }
     }
 
     fn dram_range(&self, address: u64, size: usize) -> Result<std::ops::Range<usize>, BusError> {
@@ -488,6 +570,20 @@ mod tests {
         bus.write_u32(CLINT_START + 0xbffc, 0x1122_3344).unwrap();
         assert_eq!(bus.mtime(), 0x1122_3344_5566_7788);
         assert_eq!(bus.read_u16(CLINT_START + 0xbffa), Ok(0x5566));
+    }
+
+    #[test]
+    fn uart_supports_wide_accesses() {
+        let mut bus = Bus::new(16);
+        bus.push_uart_input(b"AB");
+        // 16-bit read at the receive buffer pops one byte per byte lane.
+        assert_eq!(bus.read_u16(UART_START), Ok(u16::from_le_bytes([b'A', 0])));
+        // 32-bit write to the transmit register emits the low byte.
+        bus.write_u32(UART_START, u32::from(b'X')).unwrap();
+        assert_eq!(&bus.uart_output()[bus.uart_output().len() - 1..], b"X");
+        // Wide reads covering the line-status register report data-ready.
+        let status = bus.peek_u64(UART_START).unwrap();
+        assert_ne!((status >> 40) & 1, 0); // LSR data ready for pending 'B'
     }
 
     #[test]

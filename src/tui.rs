@@ -989,7 +989,7 @@ fn collect_page_table_lines(
     let mut nonzero = 0usize;
     for index in 0..512u64 {
         let pte_address = table + index * PTE_SIZE;
-        let Ok(pte) = bus.read_u64(pte_address) else {
+        let Ok(pte) = bus.peek_u64(pte_address) else {
             continue;
         };
         if pte == 0 {
@@ -1160,7 +1160,7 @@ fn code_addresses(first: u64, rows: u64, debugger: &Debugger) -> Vec<u64> {
         let size = debugger
             .machine
             .bus
-            .read_u16(physical)
+            .peek_u16(physical)
             .map(encoded_instruction_size)
             .unwrap_or(INSTRUCTION_SIZE);
         address = address.wrapping_add(size);
@@ -1177,9 +1177,9 @@ fn read_display_instruction(
         .cpu
         .translate_address_for_debug(&debugger.machine.bus, address, AddressAccess::Fetch)?
         .physical_address;
-    let half = debugger.machine.bus.read_u16(physical)?;
+    let half = debugger.machine.bus.peek_u16(physical)?;
     if encoded_instruction_size(half) == INSTRUCTION_SIZE {
-        let expanded = debugger.machine.bus.read_u32(physical)?;
+        let expanded = debugger.machine.bus.peek_u32(physical)?;
         Ok(DisplayInstruction {
             expanded,
             encoding: format!("{expanded:08x}"),
@@ -1481,6 +1481,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x73 if instruction == 0x0000_0073 => "ecall",
         0x73 if instruction == 0x3020_0073 => "mret",
         0x73 if instruction == 0x1020_0073 => "sret",
+        0x73 if instruction == 0x1050_0073 => "wfi",
         0x73 => "system",
         _ => "unknown",
     }
@@ -1857,10 +1858,10 @@ fn decode_amo(instruction: u32, debugger: &Debugger) -> Option<AmoInfo> {
         AmoWidth::Word => debugger
             .machine
             .bus
-            .read_u32(read_address)
+            .peek_u32(read_address)
             .ok()
             .map(sign_extend_word),
-        AmoWidth::Double => debugger.machine.bus.read_u64(read_address).ok(),
+        AmoWidth::Double => debugger.machine.bus.peek_u64(read_address).ok(),
     };
     let rhs = debugger.machine.cpu.register(rs2);
     let sc_success = (operation == "sc").then(|| debugger.machine.cpu.reservation_matches(address));

@@ -112,6 +112,8 @@ const INSTRUCTION_ECALL: u32 = 0x0000_0073;
 const INSTRUCTION_EBREAK: u32 = 0x0010_0073;
 const INSTRUCTION_MRET: u32 = 0x3020_0073;
 const INSTRUCTION_SRET: u32 = 0x1020_0073;
+const INSTRUCTION_WFI: u32 = 0x1050_0073;
+const INSTRUCTION_NOP: u32 = 0x0000_0013; // addi x0, x0, 0
 const INSTRUCTION_FENCE_I: u32 = 0x0000_100f;
 const UPPER_IMMEDIATE_MASK: u32 = 0xffff_f000;
 const JALR_ALIGNMENT_MASK: u64 = !1;
@@ -179,6 +181,8 @@ const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) |
 
 const TRAP_INSTRUCTION_ACCESS_FAULT: u64 = 1;
 const TRAP_ILLEGAL_INSTRUCTION: u64 = 2;
+const TRAP_LOAD_ADDRESS_MISALIGNED: u64 = 4;
+const TRAP_STORE_ADDRESS_MISALIGNED: u64 = 6;
 const TRAP_LOAD_ACCESS_FAULT: u64 = 5;
 const TRAP_STORE_ACCESS_FAULT: u64 = 7;
 const TRAP_ECALL_FROM_USER: u64 = 8;
@@ -246,6 +250,8 @@ pub enum StepError {
     InstructionAccessFault { pc: u64, address: u64 },
     LoadAccessFault { pc: u64, address: u64 },
     StoreAccessFault { pc: u64, address: u64 },
+    LoadAddressMisaligned { pc: u64, address: u64 },
+    StoreAddressMisaligned { pc: u64, address: u64 },
     InstructionPageFault { pc: u64, address: u64 },
     LoadPageFault { pc: u64, address: u64 },
     StorePageFault { pc: u64, address: u64 },
@@ -284,6 +290,18 @@ impl fmt::Display for StepError {
                 write!(
                     f,
                     "store access fault at {pc:#018x} writing {address:#018x}"
+                )
+            }
+            Self::LoadAddressMisaligned { pc, address } => {
+                write!(
+                    f,
+                    "misaligned load at {pc:#018x} reading {address:#018x}"
+                )
+            }
+            Self::StoreAddressMisaligned { pc, address } => {
+                write!(
+                    f,
+                    "misaligned store at {pc:#018x} writing {address:#018x}"
                 )
             }
             Self::InstructionPageFault { pc, address } => {
@@ -513,6 +531,14 @@ impl Cpu {
                 self.enter_trap(TRAP_STORE_ACCESS_FAULT, pc, address, false);
                 Ok(None)
             }
+            StepError::LoadAddressMisaligned { pc, address } => {
+                self.enter_trap(TRAP_LOAD_ADDRESS_MISALIGNED, pc, address, false);
+                Ok(None)
+            }
+            StepError::StoreAddressMisaligned { pc, address } => {
+                self.enter_trap(TRAP_STORE_ADDRESS_MISALIGNED, pc, address, false);
+                Ok(None)
+            }
             StepError::IllegalInstruction { pc, instruction } => {
                 self.enter_trap(TRAP_ILLEGAL_INSTRUCTION, pc, u64::from(instruction), false);
                 Ok(None)
@@ -650,6 +676,25 @@ impl Cpu {
     ) -> Result<Execution, StepError> {
         let address = self.registers[instruction.rs1];
         let funct5 = bits(instruction.raw, AMO_FUNCT_SHIFT, AMO_FUNCT_BITS);
+        let alignment_mask = match instruction.funct3 {
+            FUNCT_AMO_WORD => 0b011,
+            FUNCT_AMO_DOUBLE => 0b111,
+            _ => return Err(illegal(self.pc, instruction.raw)),
+        };
+        if address & alignment_mask != 0 {
+            // Atomics require natural alignment (RISC-V A extension).
+            return Err(if funct5 == AMO_FUNCT_LOAD_RESERVED {
+                StepError::LoadAddressMisaligned {
+                    pc: self.pc,
+                    address,
+                }
+            } else {
+                StepError::StoreAddressMisaligned {
+                    pc: self.pc,
+                    address,
+                }
+            });
+        }
         match instruction.funct3 {
             FUNCT_AMO_WORD => self.execute_amo_word(instruction, bus, address, funct5)?,
             FUNCT_AMO_DOUBLE => self.execute_amo_double(instruction, bus, address, funct5)?,
@@ -884,6 +929,11 @@ impl Cpu {
             }
             INSTRUCTION_SRET if self.privilege_mode != PrivilegeMode::User => {
                 Ok(self.execute_sret())
+            }
+            // The spec allows implementing wfi as a no-op; interrupts are
+            // checked at the top of every step anyway.
+            INSTRUCTION_WFI if self.privilege_mode != PrivilegeMode::User => {
+                Ok(Execution::Continue { next_pc })
             }
             _ if instruction.funct3 == FUNCT_SYSTEM_PRIVILEGED => Err(illegal(pc, instruction.raw)),
             _ => self.execute_csr(instruction, pc, next_pc),
@@ -1237,7 +1287,7 @@ impl Cpu {
         for level in (0..SV39_LEVELS).rev() {
             let pte_address = table.wrapping_add(vpn[level].wrapping_mul(PTE_SIZE));
             let pte = bus
-                .read_u64(pte_address)
+                .peek_u64(pte_address)
                 .map_err(|error| access_fault(self.pc, address, access, error))?;
             if pte & PTE_V == 0 || (pte & PTE_W != 0 && pte & PTE_R == 0) {
                 return Err(page_fault(self.pc, address, access));
@@ -1510,7 +1560,8 @@ fn decompress(instruction: u16) -> Result<u32, u32> {
         (0b10, 0b000) => {
             let rd = c_rd_rs1(raw);
             if rd == 0 {
-                Err(raw)
+                // c.slli with rd=0 is a HINT; execute as a no-op.
+                Ok(INSTRUCTION_NOP)
             } else {
                 Ok(encode_i(
                     c_shift_amount(raw),
@@ -1575,12 +1626,14 @@ fn decompress_lui_addi16sp(raw: u32) -> Result<u32, u32> {
         } else {
             Ok(encode_i(immediate as u32, 2, FUNCT_ADD, 2, OPCODE_OP_IMM))
         }
-    } else if rd == 0 {
-        Err(raw)
     } else {
         let immediate = c_lui_immediate(raw);
         if immediate == 0 {
+            // c.lui with a zero immediate is reserved.
             Err(raw)
+        } else if rd == 0 {
+            // c.lui with rd=0 (and nonzero immediate) is a HINT; no-op.
+            Ok(INSTRUCTION_NOP)
         } else {
             Ok(encode_u(immediate as u32, rd, OPCODE_LUI))
         }
@@ -1640,11 +1693,15 @@ fn decompress_jr_mv_ebreak_jalr_add(raw: u32) -> Result<u32, u32> {
     let rs2 = c_rs2(raw);
     let bit12 = (raw >> 12) & 1;
     match (bit12, rd_rs1, rs2) {
-        (0, 0, _) => Err(raw),
+        // c.mv with rd=0 and rs2!=0 is a HINT; rs2=0 there is reserved.
+        (0, 0, 0) => Err(raw),
+        (0, 0, _) => Ok(INSTRUCTION_NOP),
         (0, _, 0) => Ok(encode_i(0, rd_rs1, FUNCT_ADD, 0, OPCODE_JALR)),
         (0, _, _) => Ok(encode_r(FUNCT7_BASE, rs2, 0, FUNCT_ADD, rd_rs1, OPCODE_OP)),
         (1, 0, 0) => Ok(INSTRUCTION_EBREAK),
         (1, _, 0) => Ok(encode_i(0, rd_rs1, FUNCT_ADD, 1, OPCODE_JALR)),
+        // c.add with rd=0 and rs2!=0 is a HINT; execute as a no-op.
+        (1, 0, _) => Ok(INSTRUCTION_NOP),
         (1, _, _) => Ok(encode_r(
             FUNCT7_BASE,
             rs2,
@@ -2765,6 +2822,81 @@ mod tests {
             cpu.csr(CSR_MSTATUS) & MSTATUS_MPP_MASK,
             MSTATUS_MPP_SUPERVISOR
         );
+    }
+
+    #[test]
+    fn misaligned_amo_raises_store_address_misaligned_trap() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(64);
+        let vector = DRAM_START + 32;
+        cpu.csrs.mtvec = vector;
+        cpu.set_register(1, DRAM_START + 41); // not 8-byte aligned
+        bus.write_u32(
+            DRAM_START,
+            encode_amo(AMO_FUNCT_ADD, 2, 1, FUNCT_AMO_DOUBLE, 5),
+        )
+        .unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_STORE_ADDRESS_MISALIGNED);
+        assert_eq!(cpu.csr(CSR_MTVAL), DRAM_START + 41);
+    }
+
+    #[test]
+    fn misaligned_lr_raises_load_address_misaligned_trap() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(64);
+        let vector = DRAM_START + 32;
+        cpu.csrs.mtvec = vector;
+        cpu.set_register(1, DRAM_START + 42); // not 4-byte aligned
+        bus.write_u32(
+            DRAM_START,
+            encode_amo(AMO_FUNCT_LOAD_RESERVED, 0, 1, FUNCT_AMO_WORD, 5),
+        )
+        .unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_LOAD_ADDRESS_MISALIGNED);
+        assert_eq!(cpu.csr(CSR_MTVAL), DRAM_START + 42);
+    }
+
+    #[test]
+    fn wfi_is_a_noop_in_machine_mode() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        bus.write_u32(DRAM_START, INSTRUCTION_WFI).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.pc, DRAM_START + INSTRUCTION_SIZE);
+        assert_eq!(cpu.csr(CSR_INSTRET), 1);
+    }
+
+    #[test]
+    fn wfi_in_user_mode_is_illegal() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        cpu.privilege_mode = PrivilegeMode::User;
+        bus.write_u32(DRAM_START, INSTRUCTION_WFI).unwrap();
+
+        assert_illegal_instruction_trap(&mut cpu, &mut bus, INSTRUCTION_WFI);
+    }
+
+    #[test]
+    fn compressed_hint_encodings_expand_to_nop() {
+        // c.slli x0, 1
+        assert_eq!(decode_compressed_instruction(0x0006), Some(INSTRUCTION_NOP));
+        // c.lui x0, 1
+        assert_eq!(decode_compressed_instruction(0x6005), Some(INSTRUCTION_NOP));
+        // c.mv x0, x5
+        assert_eq!(decode_compressed_instruction(0x8016), Some(INSTRUCTION_NOP));
+        // c.add x0, x5
+        assert_eq!(decode_compressed_instruction(0x9016), Some(INSTRUCTION_NOP));
+        // Reserved encodings stay illegal: c.mv x0, x0 alias (jr x0) and c.lui x0, 0.
+        assert_eq!(decode_compressed_instruction(0x8002), None);
     }
 
     #[test]
