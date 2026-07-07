@@ -16,11 +16,12 @@ use rave::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
     Machine, StopReason, REGISTER_NAMES,
 };
+use std::collections::BTreeSet;
 use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
 const HELP: &str =
-    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | PgUp/PgDown scroll | quit(q)";
+    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | F7 page tables/code | PgUp/PgDown scroll | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const PC_INDEX: usize = 32;
 const MSIP_INDEX: usize = 33;
@@ -43,6 +44,23 @@ const REGISTER_TABLE_DECORATION_WIDTH: u16 = 6;
 const REGISTER_PANE_WIDTH: u16 =
     REGISTER_NAME_WIDTH + REGISTER_VALUE_WIDTH + REGISTER_TABLE_DECORATION_WIDTH;
 const INSTRUCTION_CLASS_WIDTH: usize = 10;
+const SATP_MODE_SHIFT: u64 = 60;
+const SATP_MODE_BARE: u64 = 0;
+const SATP_MODE_SV39: u64 = 8;
+const SATP_PPN_MASK: u64 = (1 << 44) - 1;
+const PAGE_SHIFT: u64 = 12;
+const PTE_SIZE: u64 = 8;
+const PTE_V: u64 = 1 << 0;
+const PTE_R: u64 = 1 << 1;
+const PTE_W: u64 = 1 << 2;
+const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
+const PTE_G: u64 = 1 << 5;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
+const PTE_PPN_SHIFT: u64 = 10;
+const PTE_PPN_MASK: u64 = (1 << 44) - 1;
+const CSR_SATP: u16 = 0x180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchInfo {
@@ -165,6 +183,12 @@ enum Mode {
     UartInput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainView {
+    Code,
+    PageTables,
+}
+
 struct App {
     mode: Mode,
     command: String,
@@ -176,8 +200,11 @@ struct App {
     quit: bool,
     pending_exit: Option<(ExitChord, Instant)>,
     edit_history: Vec<RegisterEdit>,
+    main_view: MainView,
     code_scroll_rows: i64,
     visible_code_rows: u64,
+    page_table_scroll_rows: i64,
+    visible_page_table_rows: u64,
 }
 
 impl App {
@@ -193,8 +220,11 @@ impl App {
             quit: false,
             pending_exit: None,
             edit_history: Vec::new(),
+            main_view: MainView::Code,
             code_scroll_rows: 0,
             visible_code_rows: 1,
+            page_table_scroll_rows: 0,
+            visible_page_table_rows: 1,
         }
     }
 }
@@ -254,9 +284,13 @@ fn handle_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
         confirm_exit(chord, app);
         return;
     }
+    if key.code == KeyCode::F(7) {
+        toggle_main_view(app);
+        return;
+    }
     if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
         let direction = if key.code == KeyCode::PageUp { -1 } else { 1 };
-        scroll_code_page(app, direction);
+        scroll_main_view_page(app, direction);
         return;
     }
     app.pending_exit = None;
@@ -271,15 +305,44 @@ fn handle_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
 
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_code_rows(app, -MOUSE_WHEEL_CODE_ROWS),
-        MouseEventKind::ScrollDown => scroll_code_rows(app, MOUSE_WHEEL_CODE_ROWS),
+        MouseEventKind::ScrollUp => scroll_main_view_rows(app, -MOUSE_WHEEL_CODE_ROWS),
+        MouseEventKind::ScrollDown => scroll_main_view_rows(app, MOUSE_WHEEL_CODE_ROWS),
         _ => {}
     }
 }
 
-fn scroll_code_page(app: &mut App, direction: i64) {
-    let rows = app.visible_code_rows.saturating_sub(1).max(1);
-    scroll_code_rows(app, direction.saturating_mul(rows as i64));
+fn toggle_main_view(app: &mut App) {
+    match app.main_view {
+        MainView::Code => show_page_tables(app),
+        MainView::PageTables => show_code(app),
+    }
+}
+
+fn show_page_tables(app: &mut App) {
+    app.main_view = MainView::PageTables;
+    app.status = "page-table browser; press F7 for code view".into();
+}
+
+fn show_code(app: &mut App) {
+    app.main_view = MainView::Code;
+    app.status = "code view".into();
+}
+
+fn scroll_main_view_page(app: &mut App, direction: i64) {
+    let rows = match app.main_view {
+        MainView::Code => app.visible_code_rows,
+        MainView::PageTables => app.visible_page_table_rows,
+    }
+    .saturating_sub(1)
+    .max(1);
+    scroll_main_view_rows(app, direction.saturating_mul(rows as i64));
+}
+
+fn scroll_main_view_rows(app: &mut App, rows: i64) {
+    match app.main_view {
+        MainView::Code => scroll_code_rows(app, rows),
+        MainView::PageTables => scroll_page_table_rows(app, rows),
+    }
 }
 
 fn scroll_code_rows(app: &mut App, rows: i64) {
@@ -292,6 +355,14 @@ fn scroll_code_rows(app: &mut App, rows: i64) {
             app.code_scroll_rows
         )
     };
+}
+
+fn scroll_page_table_rows(app: &mut App, rows: i64) {
+    app.page_table_scroll_rows = app.page_table_scroll_rows.saturating_add(rows);
+    app.status = format!(
+        "page-table view offset by {} row(s)",
+        app.page_table_scroll_rows
+    );
 }
 
 fn follow_current_code(app: &mut App) {
@@ -525,7 +596,7 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(REGISTER_PANE_WIDTH)])
         .split(outer[0]);
-    draw_code(frame, body[0], debugger, app);
+    draw_main_view(frame, body[0], debugger, app);
     draw_right_column(frame, body[1], debugger, app);
     draw_uart(frame, outer[1], debugger);
     frame.render_widget(
@@ -535,6 +606,13 @@ fn draw(frame: &mut Frame<'_>, debugger: &Debugger, app: &mut App) {
         outer[2],
     );
     draw_prompt(frame, outer[3], app);
+}
+
+fn draw_main_view(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut App) {
+    match app.main_view {
+        MainView::Code => draw_code(frame, area, debugger, app),
+        MainView::PageTables => draw_page_tables(frame, area, debugger, app),
+    }
 }
 
 fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut App) {
@@ -807,6 +885,235 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut A
     );
 }
 
+fn draw_page_tables(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut App) {
+    let rows = visible_code_rows(area);
+    app.visible_page_table_rows = rows;
+    let all_lines = page_table_lines(debugger);
+    let start = scroll_start(app.page_table_scroll_rows, all_lines.len(), rows as usize);
+    let visible: Vec<Line<'_>> = all_lines
+        .into_iter()
+        .skip(start)
+        .take(rows as usize)
+        .collect();
+    frame.render_widget(
+        Paragraph::new(visible).block(
+            Block::default()
+                .title(" Page tables (F7 code view) ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn scroll_start(scroll_rows: i64, len: usize, visible_rows: usize) -> usize {
+    let max_start = len.saturating_sub(visible_rows.max(1));
+    if scroll_rows <= 0 {
+        0
+    } else {
+        (scroll_rows as usize).min(max_start)
+    }
+}
+
+fn page_table_lines(debugger: &Debugger) -> Vec<Line<'static>> {
+    let satp = debugger.machine.cpu.csr(CSR_SATP);
+    let mode = satp >> SATP_MODE_SHIFT;
+    let root = (satp & SATP_PPN_MASK) << PAGE_SHIFT;
+    let mut lines = vec![Line::from(vec![
+        Span::styled("satp ", Style::default().fg(Color::Blue)),
+        Span::styled(format!("{satp:#018x}"), Style::default().fg(Color::Yellow)),
+        Span::raw(format!("  mode {}", satp_mode_name(mode))),
+    ])];
+
+    if mode == SATP_MODE_BARE {
+        lines.push(Line::from(
+            "paging disabled: virtual addresses are physical addresses",
+        ));
+        return lines;
+    }
+    if mode != SATP_MODE_SV39 {
+        lines.push(Line::from(format!("unsupported satp mode {mode}")));
+        return lines;
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("root ", Style::default().fg(Color::Blue)),
+        Span::styled(
+            format!("{root:#018x}"),
+            Style::default().fg(Color::LightCyan),
+        ),
+    ]));
+    let mut visited = BTreeSet::new();
+    collect_page_table_lines(
+        &debugger.machine.bus,
+        root,
+        2,
+        0,
+        0,
+        &mut visited,
+        &mut lines,
+    );
+    lines
+}
+
+fn satp_mode_name(mode: u64) -> &'static str {
+    match mode {
+        SATP_MODE_BARE => "Bare",
+        SATP_MODE_SV39 => "Sv39",
+        _ => "unknown",
+    }
+}
+
+fn collect_page_table_lines(
+    bus: &rave::Bus,
+    table: u64,
+    level: usize,
+    va_prefix: u64,
+    depth: usize,
+    visited: &mut BTreeSet<u64>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    if !visited.insert(table) {
+        lines.push(Line::from(format!(
+            "{}cycle: page table {table:#018x} already visited",
+            page_table_indent(depth)
+        )));
+        return;
+    }
+
+    let mut nonzero = 0usize;
+    for index in 0..512u64 {
+        let pte_address = table + index * PTE_SIZE;
+        let Ok(pte) = bus.read_u64(pte_address) else {
+            continue;
+        };
+        if pte == 0 {
+            continue;
+        }
+        nonzero += 1;
+        let shift = PAGE_SHIFT + 9 * level as u64;
+        let child_prefix = va_prefix | (index << shift);
+        let flags = pte_flags(pte);
+        let ppn = (pte >> PTE_PPN_SHIFT) & PTE_PPN_MASK;
+        let physical = ppn << PAGE_SHIFT;
+        let indent = page_table_indent(depth);
+
+        if pte & PTE_V == 0 || (pte & PTE_W != 0 && pte & PTE_R == 0) {
+            lines.push(Line::from(vec![
+                Span::raw(format!("{indent}L{level} [{index:03}] invalid ")),
+                Span::styled(
+                    format!("pte@{pte_address:#018x}"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" = {pte:#018x} {flags}")),
+            ]));
+            continue;
+        }
+
+        if pte & (PTE_R | PTE_X) == 0 {
+            lines.push(Line::from(vec![
+                Span::raw(format!("{indent}L{level} [{index:03}] table  ")),
+                Span::styled(
+                    format!("pte@{pte_address:#018x}"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(" -> "),
+                Span::styled(
+                    format!("{physical:#018x}"),
+                    Style::default().fg(Color::LightCyan),
+                ),
+                Span::raw(format!(" {flags}")),
+            ]));
+            if level > 0 {
+                collect_page_table_lines(
+                    bus,
+                    physical,
+                    level - 1,
+                    child_prefix,
+                    depth + 1,
+                    visited,
+                    lines,
+                );
+            }
+            continue;
+        }
+
+        let size = page_size_for_level(level);
+        let va_start = sv39_sign_extend(child_prefix);
+        let va_end = va_start.wrapping_add(size - 1);
+        let pa_end = physical.wrapping_add(size - 1);
+        lines.push(Line::from(vec![
+            Span::raw(format!("{indent}L{level} [{index:03}] leaf   ")),
+            Span::styled(
+                format!("{va_start:#018x}"),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(".."),
+            Span::styled(format!("{va_end:#018x}"), Style::default().fg(Color::Cyan)),
+            Span::raw(" -> "),
+            Span::styled(
+                format!("{physical:#018x}"),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::raw(".."),
+            Span::styled(
+                format!("{pa_end:#018x}"),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::raw(format!(" {flags} {}", page_size_label(size))),
+        ]));
+    }
+
+    if nonzero == 0 {
+        lines.push(Line::from(format!(
+            "{}L{level} table {table:#018x}: empty",
+            page_table_indent(depth)
+        )));
+    }
+}
+
+fn page_table_indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
+
+fn pte_flags(pte: u64) -> String {
+    [
+        (PTE_V, 'V'),
+        (PTE_R, 'R'),
+        (PTE_W, 'W'),
+        (PTE_X, 'X'),
+        (PTE_U, 'U'),
+        (PTE_G, 'G'),
+        (PTE_A, 'A'),
+        (PTE_D, 'D'),
+    ]
+    .into_iter()
+    .map(|(bit, label)| if pte & bit != 0 { label } else { '-' })
+    .collect()
+}
+
+fn page_size_for_level(level: usize) -> u64 {
+    1 << (PAGE_SHIFT + level as u64 * 9)
+}
+
+fn page_size_label(size: u64) -> &'static str {
+    match size {
+        0x1000 => "4K",
+        0x20_0000 => "2M",
+        0x4000_0000 => "1G",
+        _ => "?",
+    }
+}
+
+fn sv39_sign_extend(address: u64) -> u64 {
+    let mask = (1u64 << 39) - 1;
+    let value = address & mask;
+    if value & (1 << 38) != 0 {
+        value | !mask
+    } else {
+        value
+    }
+}
+
 fn scrolled_code_start(pc: u64, rows_before_pc: u64, scroll_rows: i64) -> u64 {
     let centered = pc
         .saturating_sub(INSTRUCTION_SIZE.saturating_mul(rows_before_pc))
@@ -1043,12 +1350,12 @@ fn pseudo_register_pane_title(app: &App) -> &'static str {
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (title, content) = match app.mode {
         Mode::Command => (
-            " Command [Enter repeats last; F5 continue, F10 next, F11 step; PgUp/PgDown scroll] ",
+            " Command [Enter repeats last; F5 continue, F6 UART, F7 page tables/code, F10 next, F11 step; PgUp/PgDown scroll] ",
             app.command.as_str(),
         ),
         Mode::RegisterSelect => (
             " Right pane navigation ",
-            "Up/Down select, Enter edit, u undo, r/s/n/c execute, q quit",
+            "Up/Down select, Enter edit, u undo, r/s/n/c execute, F7 view, q quit",
         ),
         Mode::RegisterEdit => (" New register value ", app.edit_value.as_str()),
         Mode::UartInput => (
