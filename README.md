@@ -18,8 +18,9 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 - mixed 16-bit and 32-bit instruction fetch
 - raw binaries loaded into DRAM at `0x8000_0000`
 - `ebreak` as a temporary host exit boundary; register `a0` is the result code
-- polled 16550-style UART input and output at `0x1000_0000`
+- 16550-style UART input and output at `0x1000_0000`, including receive interrupts
 - CLINT `msip`, `mtimecmp`, and `mtime` registers with machine software/timer interrupts
+- PLIC UART external interrupt source 10 with machine and supervisor contexts
 
 Run a raw guest image with:
 
@@ -82,6 +83,12 @@ Machine-software interrupt demo:
 cargo run -- --interactive demo/msip.bin
 ```
 
+PLIC UART receive interrupt demo:
+
+```sh
+printf P | cargo run -- demo/plic.bin
+```
+
 Sv39 address-translation demo:
 
 ```sh
@@ -97,4 +104,4 @@ Auto tests:
 cargo test
 ```
 
-PLIC, virtio, and a real firmware/boot path are intentionally not here yet. Full OS boot still needs more privilege and device work.
+Virtio and a real firmware/boot path are intentionally not here yet. Full OS boot still needs more privilege and device work.

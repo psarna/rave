@@ -1,0 +1,52 @@
+__asm__(
+".section .text\n"
+".globl _start\n"
+"_start:\n"
+"  la t0, trap_handler\n"
+"  csrw mtvec, t0\n"
+"  li t0, 0x0c000028\n"      // PLIC priority for UART source 10.
+"  li t1, 1\n"
+"  sw t1, 0(t0)\n"
+"  li t0, 0x0c002000\n"      // PLIC machine-context enable word.
+"  li t1, (1 << 10)\n"
+"  sw t1, 0(t0)\n"
+"  li t0, 0x0c200000\n"      // PLIC machine-context threshold.
+"  sw zero, 0(t0)\n"
+"  li t0, 0x10000001\n"      // UART interrupt-enable register.
+"  li t1, 1\n"
+"  sb t1, 0(t0)\n"
+"  li t0, (1 << 11)\n"       // mie.MEIE.
+"  csrw mie, t0\n"
+"  li t0, (1 << 3)\n"        // mstatus.MIE.
+"  csrs mstatus, t0\n"
+"  la s0, byte_seen\n"
+"wait_uart:\n"
+"  ld t0, 0(s0)\n"
+"  beqz t0, wait_uart\n"
+"  li t0, 0x10000000\n"
+"  lbu t1, 0(s0)\n"
+"  sb t1, 0(t0)\n"
+"  li a0, 0\n"
+"  ebreak\n"
+"trap_handler:\n"
+"  csrr t0, mcause\n"
+"  li t1, ((1 << 63) | 11)\n"
+"  bne t0, t1, trap_fail\n"
+"  li t0, 0x0c200004\n"      // PLIC machine-context claim/complete.
+"  lw t1, 0(t0)\n"
+"  li t2, 10\n"
+"  bne t1, t2, trap_fail\n"
+"  li t3, 0x10000000\n"
+"  lbu t4, 0(t3)\n"
+"  la t3, byte_seen\n"
+"  sd t4, 0(t3)\n"
+"  sw t1, 0(t0)\n"
+"  mret\n"
+"trap_fail:\n"
+"  li a0, 2\n"
+"  ebreak\n"
+".section .bss\n"
+".align 3\n"
+"byte_seen:\n"
+"  .dword 0\n"
+);

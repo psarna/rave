@@ -4,6 +4,21 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
+pub const PC_REGISTER_INDEX: usize = 32;
+pub const MSIP_REGISTER_INDEX: usize = 33;
+pub const MTIME_REGISTER_INDEX: usize = 34;
+pub const MTIMECMP_REGISTER_INDEX: usize = 35;
+pub const UART_IER_REGISTER_INDEX: usize = 36;
+pub const PLIC_UART_PRIORITY_REGISTER_INDEX: usize = 37;
+pub const PLIC_PENDING_REGISTER_INDEX: usize = 38;
+pub const PLIC_MACHINE_ENABLE_REGISTER_INDEX: usize = 39;
+pub const PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX: usize = 40;
+pub const PLIC_MACHINE_THRESHOLD_REGISTER_INDEX: usize = 41;
+pub const PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX: usize = 42;
+pub const PLIC_MACHINE_CLAIM_REGISTER_INDEX: usize = 43;
+pub const PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX: usize = 44;
+pub const SATP_REGISTER_INDEX: usize = 45;
+
 pub const REGISTER_NAMES: [&str; 32] = [
     "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
     "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
@@ -112,6 +127,27 @@ pub fn parse_register(name: &str) -> Result<usize, CommandError> {
     let name = name.trim_start_matches('$');
     if name == "fp" {
         return Ok(8);
+    }
+    match name {
+        "pc" => return Ok(PC_REGISTER_INDEX),
+        "msip" => return Ok(MSIP_REGISTER_INDEX),
+        "mtime" => return Ok(MTIME_REGISTER_INDEX),
+        "mtimecmp" => return Ok(MTIMECMP_REGISTER_INDEX),
+        "uart_ier" | "ier" => return Ok(UART_IER_REGISTER_INDEX),
+        "plic_prio" | "plic_priority" => return Ok(PLIC_UART_PRIORITY_REGISTER_INDEX),
+        "plic_pending" => return Ok(PLIC_PENDING_REGISTER_INDEX),
+        "plic_menable" | "plic_meie" => return Ok(PLIC_MACHINE_ENABLE_REGISTER_INDEX),
+        "plic_senable" | "plic_seie" => return Ok(PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX),
+        "plic_mthresh" | "plic_mthreshold" => {
+            return Ok(PLIC_MACHINE_THRESHOLD_REGISTER_INDEX);
+        }
+        "plic_sthresh" | "plic_sthreshold" => {
+            return Ok(PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX);
+        }
+        "plic_mclaim" => return Ok(PLIC_MACHINE_CLAIM_REGISTER_INDEX),
+        "plic_sclaim" => return Ok(PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX),
+        "satp" => return Ok(SATP_REGISTER_INDEX),
+        _ => {}
     }
     if let Some(index) = REGISTER_NAMES
         .iter()
@@ -275,6 +311,37 @@ impl Debugger {
         }
     }
 
+    fn set_register_or_pseudo(&mut self, index: usize, value: u64) {
+        match index {
+            PC_REGISTER_INDEX => self.machine.cpu.pc = value,
+            MSIP_REGISTER_INDEX => self.machine.bus.set_msip(value),
+            MTIME_REGISTER_INDEX => self.machine.bus.set_mtime(value),
+            MTIMECMP_REGISTER_INDEX => self.machine.bus.set_mtimecmp(value),
+            UART_IER_REGISTER_INDEX => self.machine.bus.set_uart_interrupt_enable(value),
+            PLIC_UART_PRIORITY_REGISTER_INDEX => self.machine.bus.set_plic_uart_priority(value),
+            PLIC_PENDING_REGISTER_INDEX => {}
+            PLIC_MACHINE_ENABLE_REGISTER_INDEX => self.machine.bus.set_plic_machine_enable(value),
+            PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX => {
+                self.machine.bus.set_plic_supervisor_enable(value)
+            }
+            PLIC_MACHINE_THRESHOLD_REGISTER_INDEX => {
+                self.machine.bus.set_plic_machine_threshold(value)
+            }
+            PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX => {
+                self.machine.bus.set_plic_supervisor_threshold(value);
+            }
+            PLIC_MACHINE_CLAIM_REGISTER_INDEX => {
+                self.machine.bus.complete_plic_machine_claim(value)
+            }
+            PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => {
+                self.machine.bus.complete_plic_supervisor_claim(value);
+            }
+            SATP_REGISTER_INDEX => {}
+            _ if index < REGISTER_NAMES.len() => self.machine.cpu.set_register(index, value),
+            _ => {}
+        }
+    }
+
     pub fn execute(
         &mut self,
         command: Command,
@@ -297,7 +364,7 @@ impl Debugger {
                 Ok(None)
             }
             Command::SetRegister { index, value } => {
-                self.machine.cpu.set_register(index, value);
+                self.set_register_or_pseudo(index, value);
                 Ok(None)
             }
             Command::Undo | Command::Help | Command::Quit => Ok(None),
@@ -335,6 +402,40 @@ mod tests {
             "uart Ada Lovelace".parse(),
             Ok(Command::UartInput("Ada Lovelace".into()))
         );
+        assert_eq!(
+            "set plic_prio 1".parse(),
+            Ok(Command::SetRegister {
+                index: PLIC_UART_PRIORITY_REGISTER_INDEX,
+                value: 1
+            })
+        );
+    }
+
+    #[test]
+    fn set_command_updates_platform_pseudo_registers() {
+        let mut debugger = debugger();
+
+        debugger
+            .execute(
+                Command::SetRegister {
+                    index: UART_IER_REGISTER_INDEX,
+                    value: 1,
+                },
+                10,
+            )
+            .unwrap();
+        debugger
+            .execute(
+                Command::SetRegister {
+                    index: PLIC_MACHINE_ENABLE_REGISTER_INDEX,
+                    value: 1 << 10,
+                },
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(debugger.machine.bus.uart_interrupt_enable(), 1);
+        assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
     }
 
     #[test]

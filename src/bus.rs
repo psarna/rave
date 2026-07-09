@@ -70,6 +70,7 @@ impl std::error::Error for BusError {}
 pub struct Bus {
     dram: Vec<u8>,
     clint: Clint,
+    plic: Plic,
     uart: Uart,
 }
 
@@ -81,9 +82,18 @@ struct Clint {
 }
 
 #[derive(Default)]
+struct Plic {
+    uart_priority: u32,
+    enables: [u32; Plic::CONTEXT_COUNT],
+    thresholds: [u32; Plic::CONTEXT_COUNT],
+    uart_claimed: bool,
+}
+
+#[derive(Default)]
 struct Uart {
     output: Vec<u8>,
     input: VecDeque<u8>,
+    interrupt_enable: u8,
     waiting_for_input: bool,
 }
 
@@ -95,6 +105,7 @@ impl Bus {
                 mtimecmp: u64::MAX,
                 ..Clint::default()
             },
+            plic: Plic::default(),
             uart: Uart::default(),
         }
     }
@@ -136,6 +147,16 @@ impl Bus {
         self.clint.mtime >= self.clint.mtimecmp
     }
 
+    pub fn machine_external_interrupt_pending(&self) -> bool {
+        self.plic
+            .context_interrupt_pending(Plic::MACHINE_CONTEXT, &self.uart)
+    }
+
+    pub fn supervisor_external_interrupt_pending(&self) -> bool {
+        self.plic
+            .context_interrupt_pending(Plic::SUPERVISOR_CONTEXT, &self.uart)
+    }
+
     pub fn msip(&self) -> u64 {
         u64::from(self.clint.msip)
     }
@@ -160,9 +181,80 @@ impl Bus {
         self.clint.mtimecmp = value;
     }
 
+    pub fn uart_interrupt_enable(&self) -> u64 {
+        u64::from(self.uart.interrupt_enable)
+    }
+
+    pub fn set_uart_interrupt_enable(&mut self, value: u64) {
+        self.uart.interrupt_enable = (value as u8) & Uart::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE;
+    }
+
+    pub fn plic_uart_priority(&self) -> u64 {
+        u64::from(self.plic.uart_priority)
+    }
+
+    pub fn set_plic_uart_priority(&mut self, value: u64) {
+        self.plic.uart_priority = (value as u32) & 0x7;
+    }
+
+    pub fn plic_pending(&self) -> u64 {
+        u64::from(self.plic.pending_bits(&self.uart))
+    }
+
+    pub fn plic_machine_enable(&self) -> u64 {
+        u64::from(self.plic.enables[Plic::MACHINE_CONTEXT])
+    }
+
+    pub fn set_plic_machine_enable(&mut self, value: u64) {
+        self.plic.enables[Plic::MACHINE_CONTEXT] = (value as u32) & Plic::UART_SOURCE_BIT;
+    }
+
+    pub fn plic_supervisor_enable(&self) -> u64 {
+        u64::from(self.plic.enables[Plic::SUPERVISOR_CONTEXT])
+    }
+
+    pub fn set_plic_supervisor_enable(&mut self, value: u64) {
+        self.plic.enables[Plic::SUPERVISOR_CONTEXT] = (value as u32) & Plic::UART_SOURCE_BIT;
+    }
+
+    pub fn plic_machine_threshold(&self) -> u64 {
+        u64::from(self.plic.thresholds[Plic::MACHINE_CONTEXT])
+    }
+
+    pub fn set_plic_machine_threshold(&mut self, value: u64) {
+        self.plic.thresholds[Plic::MACHINE_CONTEXT] = (value as u32) & 0x7;
+    }
+
+    pub fn plic_supervisor_threshold(&self) -> u64 {
+        u64::from(self.plic.thresholds[Plic::SUPERVISOR_CONTEXT])
+    }
+
+    pub fn set_plic_supervisor_threshold(&mut self, value: u64) {
+        self.plic.thresholds[Plic::SUPERVISOR_CONTEXT] = (value as u32) & 0x7;
+    }
+
+    pub fn plic_machine_claim(&self) -> u64 {
+        u64::from(self.plic.peek_claim(Plic::MACHINE_CONTEXT, &self.uart))
+    }
+
+    pub fn complete_plic_machine_claim(&mut self, value: u64) {
+        self.plic.complete(value as u32);
+    }
+
+    pub fn plic_supervisor_claim(&self) -> u64 {
+        u64::from(self.plic.peek_claim(Plic::SUPERVISOR_CONTEXT, &self.uart))
+    }
+
+    pub fn complete_plic_supervisor_claim(&mut self, value: u64) {
+        self.plic.complete(value as u32);
+    }
+
     pub fn read_u8(&mut self, address: u64) -> Result<u8, BusError> {
         if let Some(offset) = clint_offset(address, 1) {
             return Ok(self.clint.read(offset, 1)? as u8);
+        }
+        if let Some(offset) = plic_offset(address, 1) {
+            return Ok(self.plic.read(offset, 1, &self.uart)? as u8);
         }
         if let Some(offset) = uart_offset(address, 1) {
             return Ok(self.uart.read(offset));
@@ -175,6 +267,9 @@ impl Bus {
     pub fn peek_u8(&self, address: u64) -> Result<u8, BusError> {
         if let Some(offset) = clint_offset(address, 1) {
             return Ok(self.clint.read(offset, 1)? as u8);
+        }
+        if let Some(offset) = plic_offset(address, 1) {
+            return Ok(self.plic.peek(offset, 1, &self.uart)? as u8);
         }
         if let Some(offset) = uart_offset(address, 1) {
             return Ok(self.uart.peek(offset));
@@ -189,6 +284,9 @@ impl Bus {
         if let Some(offset) = clint_offset(address, 2) {
             return Ok(self.clint.read(offset, 2)? as u16);
         }
+        if let Some(offset) = plic_offset(address, 2) {
+            return Ok(self.plic.read(offset, 2, &self.uart)? as u16);
+        }
         let range = self.dram_range(address, 2)?;
         Ok(u16::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
@@ -200,6 +298,9 @@ impl Bus {
         if let Some(offset) = clint_offset(address, 4) {
             return Ok(self.clint.read(offset, 4)? as u32);
         }
+        if let Some(offset) = plic_offset(address, 4) {
+            return Ok(self.plic.read(offset, 4, &self.uart)? as u32);
+        }
         let range = self.dram_range(address, 4)?;
         Ok(u32::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
@@ -210,6 +311,9 @@ impl Bus {
         }
         if let Some(offset) = clint_offset(address, 8) {
             return self.clint.read(offset, 8);
+        }
+        if let Some(offset) = plic_offset(address, 8) {
+            return self.plic.read(offset, 8, &self.uart);
         }
         let range = self.dram_range(address, 8)?;
         Ok(u64::from_le_bytes(self.dram[range].try_into().unwrap()))
@@ -223,6 +327,9 @@ impl Bus {
         if let Some(offset) = clint_offset(address, 2) {
             return Ok(self.clint.read(offset, 2)? as u16);
         }
+        if let Some(offset) = plic_offset(address, 2) {
+            return Ok(self.plic.peek(offset, 2, &self.uart)? as u16);
+        }
         let range = self.dram_range(address, 2)?;
         Ok(u16::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
@@ -233,6 +340,9 @@ impl Bus {
         }
         if let Some(offset) = clint_offset(address, 4) {
             return Ok(self.clint.read(offset, 4)? as u32);
+        }
+        if let Some(offset) = plic_offset(address, 4) {
+            return Ok(self.plic.peek(offset, 4, &self.uart)? as u32);
         }
         let range = self.dram_range(address, 4)?;
         Ok(u32::from_le_bytes(self.dram[range].try_into().unwrap()))
@@ -245,6 +355,9 @@ impl Bus {
         if let Some(offset) = clint_offset(address, 8) {
             return self.clint.read(offset, 8);
         }
+        if let Some(offset) = plic_offset(address, 8) {
+            return self.plic.peek(offset, 8, &self.uart);
+        }
         let range = self.dram_range(address, 8)?;
         Ok(u64::from_le_bytes(self.dram[range].try_into().unwrap()))
     }
@@ -252,6 +365,10 @@ impl Bus {
     pub fn write_u8(&mut self, address: u64, value: u8) -> Result<(), BusError> {
         if let Some(offset) = clint_offset(address, 1) {
             self.clint.write(offset, 1, u64::from(value))?;
+            return Ok(());
+        }
+        if let Some(offset) = plic_offset(address, 1) {
+            self.plic.write(offset, 1, u64::from(value))?;
             return Ok(());
         }
         if let Some(offset) = uart_offset(address, 1) {
@@ -272,6 +389,10 @@ impl Bus {
             self.clint.write(offset, 2, u64::from(value))?;
             return Ok(());
         }
+        if let Some(offset) = plic_offset(address, 2) {
+            self.plic.write(offset, 2, u64::from(value))?;
+            return Ok(());
+        }
         let range = self.dram_range(address, 2)?;
         self.dram[range].copy_from_slice(&value.to_le_bytes());
         Ok(())
@@ -286,6 +407,10 @@ impl Bus {
             self.clint.write(offset, 4, u64::from(value))?;
             return Ok(());
         }
+        if let Some(offset) = plic_offset(address, 4) {
+            self.plic.write(offset, 4, u64::from(value))?;
+            return Ok(());
+        }
         let range = self.dram_range(address, 4)?;
         self.dram[range].copy_from_slice(&value.to_le_bytes());
         Ok(())
@@ -298,6 +423,10 @@ impl Bus {
         }
         if let Some(offset) = clint_offset(address, 8) {
             self.clint.write(offset, 8, value)?;
+            return Ok(());
+        }
+        if let Some(offset) = plic_offset(address, 8) {
+            self.plic.write(offset, 8, value)?;
             return Ok(());
         }
         let range = self.dram_range(address, 8)?;
@@ -402,9 +531,184 @@ impl Clint {
     }
 }
 
+impl Plic {
+    const UART_SOURCE: u32 = 10;
+    const UART_SOURCE_BIT: u32 = 1 << Self::UART_SOURCE;
+    const CONTEXT_COUNT: usize = 2;
+    const MACHINE_CONTEXT: usize = 0;
+    const SUPERVISOR_CONTEXT: usize = 1;
+    const PRIORITY_BASE: u64 = 0x0000;
+    const PENDING_BASE: u64 = 0x1000;
+    const ENABLE_BASE: u64 = 0x2000;
+    const ENABLE_STRIDE: u64 = 0x80;
+    const CONTEXT_BASE: u64 = 0x20_0000;
+    const CONTEXT_STRIDE: u64 = 0x1000;
+    const THRESHOLD_OFFSET: u64 = 0;
+    const CLAIM_COMPLETE_OFFSET: u64 = 4;
+    const REGISTER_SIZE: u64 = 4;
+
+    fn context_interrupt_pending(&self, context: usize, uart: &Uart) -> bool {
+        self.pending_source(uart)
+            .is_some_and(|source| self.source_enabled(context, source))
+    }
+
+    fn read(&mut self, offset: u64, size: usize, uart: &Uart) -> Result<u64, BusError> {
+        if let Some(context) = context_claim_complete(offset, size) {
+            return Ok(read_le_field(
+                u64::from(self.claim(context, uart)),
+                offset - context_register(context, Self::CLAIM_COMPLETE_OFFSET),
+                size,
+            ));
+        }
+        self.peek(offset, size, uart)
+    }
+
+    fn peek(&self, offset: u64, size: usize, uart: &Uart) -> Result<u64, BusError> {
+        if register_contains(
+            offset,
+            size,
+            Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE,
+            Self::REGISTER_SIZE,
+        ) {
+            return Ok(read_le_field(
+                u64::from(self.uart_priority),
+                offset - (Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE),
+                size,
+            ));
+        }
+        if register_contains(offset, size, Self::PENDING_BASE, Self::REGISTER_SIZE) {
+            return Ok(read_le_field(
+                u64::from(self.pending_bits(uart)),
+                offset - Self::PENDING_BASE,
+                size,
+            ));
+        }
+        if let Some(context) = context_enable(offset, size) {
+            return Ok(read_le_field(
+                u64::from(self.enables[context]),
+                offset - enable_register(context),
+                size,
+            ));
+        }
+        if let Some(context) = context_threshold(offset, size) {
+            return Ok(read_le_field(
+                u64::from(self.thresholds[context]),
+                offset - context_register(context, Self::THRESHOLD_OFFSET),
+                size,
+            ));
+        }
+        if let Some(context) = context_claim_complete(offset, size) {
+            let claim = self.peek_claim(context, uart);
+            return Ok(read_le_field(
+                u64::from(claim),
+                offset - context_register(context, Self::CLAIM_COMPLETE_OFFSET),
+                size,
+            ));
+        }
+        Err(BusError::Unmapped {
+            address: PLIC_START + offset,
+            size,
+        })
+    }
+
+    fn write(&mut self, offset: u64, size: usize, value: u64) -> Result<(), BusError> {
+        if register_contains(
+            offset,
+            size,
+            Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE,
+            Self::REGISTER_SIZE,
+        ) {
+            let next = write_le_field(
+                u64::from(self.uart_priority),
+                offset - (Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE),
+                size,
+                value,
+            );
+            self.uart_priority = (next as u32) & 0x7;
+            return Ok(());
+        }
+        if let Some(context) = context_enable(offset, size) {
+            let next = write_le_field(
+                u64::from(self.enables[context]),
+                offset - enable_register(context),
+                size,
+                value,
+            );
+            self.enables[context] = (next as u32) & Self::UART_SOURCE_BIT;
+            return Ok(());
+        }
+        if let Some(context) = context_threshold(offset, size) {
+            let next = write_le_field(
+                u64::from(self.thresholds[context]),
+                offset - context_register(context, Self::THRESHOLD_OFFSET),
+                size,
+                value,
+            );
+            self.thresholds[context] = (next as u32) & 0x7;
+            return Ok(());
+        }
+        if context_claim_complete(offset, size).is_some() {
+            let source = write_le_field(0, offset & 0b11, size, value) as u32;
+            self.complete(source);
+            return Ok(());
+        }
+        Err(BusError::Unmapped {
+            address: PLIC_START + offset,
+            size,
+        })
+    }
+
+    fn peek_claim(&self, context: usize, uart: &Uart) -> u32 {
+        self.pending_source(uart)
+            .filter(|source| self.source_enabled(context, *source))
+            .unwrap_or(0)
+    }
+
+    fn complete(&mut self, source: u32) {
+        if source == Self::UART_SOURCE {
+            self.uart_claimed = false;
+        }
+    }
+
+    fn claim(&mut self, context: usize, uart: &Uart) -> u32 {
+        if self
+            .pending_source(uart)
+            .is_some_and(|source| self.source_enabled(context, source))
+        {
+            self.uart_claimed = true;
+            Self::UART_SOURCE
+        } else {
+            0
+        }
+    }
+
+    fn pending_bits(&self, uart: &Uart) -> u32 {
+        self.pending_source(uart)
+            .map(|_| Self::UART_SOURCE_BIT)
+            .unwrap_or(0)
+    }
+
+    fn pending_source(&self, uart: &Uart) -> Option<u32> {
+        if !self.uart_claimed && self.uart_priority > 0 && uart.receive_interrupt_pending() {
+            Some(Self::UART_SOURCE)
+        } else {
+            None
+        }
+    }
+
+    fn source_enabled(&self, context: usize, source: u32) -> bool {
+        self.enables[context] & (1 << source) != 0 && self.uart_priority > self.thresholds[context]
+    }
+}
+
 impl Uart {
     const RECEIVER_BUFFER_OR_TRANSMIT_HOLDING: u64 = 0;
+    const INTERRUPT_ENABLE: u64 = 1;
+    const INTERRUPT_IDENTIFICATION: u64 = 2;
     const LINE_STATUS: u64 = 5;
+    const INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE: u8 = 1;
+    const INTERRUPT_IDENTIFICATION_NO_INTERRUPT: u8 = 1;
+    const INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE: u8 = 0x04;
     const LINE_STATUS_DATA_READY: u8 = 1;
     const LINE_STATUS_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 5;
     const LINE_STATUS_TRANSMITTER_EMPTY: u8 = 1 << 6;
@@ -416,6 +720,8 @@ impl Uart {
                 self.waiting_for_input = value.is_none();
                 value.unwrap_or(0)
             }
+            Self::INTERRUPT_ENABLE => self.interrupt_enable,
+            Self::INTERRUPT_IDENTIFICATION => self.interrupt_identification(),
             Self::LINE_STATUS => {
                 let has_input = !self.input.is_empty();
                 self.waiting_for_input = !has_input;
@@ -427,11 +733,24 @@ impl Uart {
 
     fn peek(&self, offset: u64) -> u8 {
         match offset {
-            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => {
-                self.input.front().copied().unwrap_or(0)
-            }
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => self.input.front().copied().unwrap_or(0),
+            Self::INTERRUPT_ENABLE => self.interrupt_enable,
+            Self::INTERRUPT_IDENTIFICATION => self.interrupt_identification(),
             Self::LINE_STATUS => Self::line_status(!self.input.is_empty()),
             _ => 0,
+        }
+    }
+
+    fn receive_interrupt_pending(&self) -> bool {
+        self.interrupt_enable & Self::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE != 0
+            && !self.input.is_empty()
+    }
+
+    fn interrupt_identification(&self) -> u8 {
+        if self.receive_interrupt_pending() {
+            Self::INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE
+        } else {
+            Self::INTERRUPT_IDENTIFICATION_NO_INTERRUPT
         }
     }
 
@@ -445,16 +764,65 @@ impl Uart {
     }
 
     fn write(&mut self, offset: u64, value: u8) {
-        if offset == Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING {
-            self.output.push(value);
+        match offset {
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => self.output.push(value),
+            Self::INTERRUPT_ENABLE => {
+                self.interrupt_enable = value & Self::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE;
+            }
+            _ => {}
         }
     }
+}
+
+fn context_enable(offset: u64, size: usize) -> Option<usize> {
+    (0..Plic::CONTEXT_COUNT).find(|context| {
+        register_contains(offset, size, enable_register(*context), Plic::REGISTER_SIZE)
+    })
+}
+
+fn context_threshold(offset: u64, size: usize) -> Option<usize> {
+    (0..Plic::CONTEXT_COUNT).find(|context| {
+        register_contains(
+            offset,
+            size,
+            context_register(*context, Plic::THRESHOLD_OFFSET),
+            Plic::REGISTER_SIZE,
+        )
+    })
+}
+
+fn context_claim_complete(offset: u64, size: usize) -> Option<usize> {
+    (0..Plic::CONTEXT_COUNT).find(|context| {
+        register_contains(
+            offset,
+            size,
+            context_register(*context, Plic::CLAIM_COMPLETE_OFFSET),
+            Plic::REGISTER_SIZE,
+        )
+    })
+}
+
+fn enable_register(context: usize) -> u64 {
+    Plic::ENABLE_BASE + context as u64 * Plic::ENABLE_STRIDE
+}
+
+fn context_register(context: usize, register: u64) -> u64 {
+    Plic::CONTEXT_BASE + context as u64 * Plic::CONTEXT_STRIDE + register
 }
 
 fn clint_offset(address: u64, size: usize) -> Option<u64> {
     let end = address.checked_add(size as u64)?;
     if address >= CLINT_START && end <= CLINT_START + CLINT_SIZE {
         Some(address - CLINT_START)
+    } else {
+        None
+    }
+}
+
+fn plic_offset(address: u64, size: usize) -> Option<u64> {
+    let end = address.checked_add(size as u64)?;
+    if address >= PLIC_START && end <= PLIC_START + PLIC_SIZE {
+        Some(address - PLIC_START)
     } else {
         None
     }
@@ -497,7 +865,6 @@ fn stub_region(address: u64, size: usize) -> Option<Region> {
     let end = address.checked_add(size as u64)?;
     [
         (ROM_START, ROM_SIZE, Region::Rom),
-        (PLIC_START, PLIC_SIZE, Region::Plic),
         (VIRTIO_START, VIRTIO_SIZE, Region::Virtio),
     ]
     .into_iter()
@@ -528,6 +895,54 @@ mod tests {
                 size: 1,
             })
         );
+    }
+
+    #[test]
+    fn plic_routes_uart_receive_interrupt_to_machine_context() {
+        let mut bus = Bus::new(16);
+        bus.push_uart_input(b"A");
+        bus.write_u8(UART_START + 1, 1).unwrap();
+        assert!(!bus.machine_external_interrupt_pending());
+
+        bus.write_u32(PLIC_START + 10 * 4, 1).unwrap();
+        bus.write_u32(PLIC_START + 0x2000, 1 << 10).unwrap();
+        bus.write_u32(PLIC_START + 0x20_0000, 0).unwrap();
+
+        assert!(bus.machine_external_interrupt_pending());
+        assert_eq!(bus.read_u32(PLIC_START + 0x1000).unwrap(), 1 << 10);
+        assert_eq!(bus.peek_u32(PLIC_START + 0x20_0004).unwrap(), 10);
+        assert_eq!(bus.read_u32(PLIC_START + 0x20_0004).unwrap(), 10);
+        assert!(!bus.machine_external_interrupt_pending());
+
+        assert_eq!(bus.read_u8(UART_START).unwrap(), b'A');
+        bus.write_u32(PLIC_START + 0x20_0004, 10).unwrap();
+        assert!(!bus.machine_external_interrupt_pending());
+    }
+
+    #[test]
+    fn plic_routes_uart_receive_interrupt_to_supervisor_context() {
+        let mut bus = Bus::new(16);
+        bus.push_uart_input(b"B");
+        bus.write_u8(UART_START + 1, 1).unwrap();
+        bus.write_u32(PLIC_START + 10 * 4, 2).unwrap();
+        bus.write_u32(PLIC_START + 0x2080, 1 << 10).unwrap();
+        bus.write_u32(PLIC_START + 0x20_1000, 1).unwrap();
+
+        assert!(bus.supervisor_external_interrupt_pending());
+        assert!(!bus.machine_external_interrupt_pending());
+        assert_eq!(bus.read_u32(PLIC_START + 0x20_1004).unwrap(), 10);
+    }
+
+    #[test]
+    fn uart_interrupt_identification_tracks_receive_interrupt_enable() {
+        let mut bus = Bus::new(16);
+        bus.push_uart_input(b"C");
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(1));
+        bus.write_u8(UART_START + 1, 1).unwrap();
+        assert_eq!(bus.read_u8(UART_START + 1), Ok(1));
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(4));
+        assert_eq!(bus.read_u8(UART_START), Ok(b'C'));
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(1));
     }
 
     #[test]

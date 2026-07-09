@@ -293,16 +293,10 @@ impl fmt::Display for StepError {
                 )
             }
             Self::LoadAddressMisaligned { pc, address } => {
-                write!(
-                    f,
-                    "misaligned load at {pc:#018x} reading {address:#018x}"
-                )
+                write!(f, "misaligned load at {pc:#018x} reading {address:#018x}")
             }
             Self::StoreAddressMisaligned { pc, address } => {
-                write!(
-                    f,
-                    "misaligned store at {pc:#018x} writing {address:#018x}"
-                )
+                write!(f, "misaligned store at {pc:#018x} writing {address:#018x}")
             }
             Self::InstructionPageFault { pc, address } => {
                 write!(
@@ -1040,12 +1034,18 @@ impl Cpu {
     }
 
     fn refresh_interrupt_pending(&mut self, bus: &Bus) {
-        self.csrs.mip &= !(MIP_MSIP | MIP_MTIP);
+        self.csrs.mip &= !(MIP_MSIP | MIP_MTIP | MIP_MEIP);
         if bus.machine_software_interrupt_pending() {
             self.csrs.mip |= MIP_MSIP;
         }
         if bus.machine_timer_interrupt_pending() {
             self.csrs.mip |= MIP_MTIP;
+        }
+        if bus.machine_external_interrupt_pending() {
+            self.csrs.mip |= MIP_MEIP;
+        }
+        if bus.supervisor_external_interrupt_pending() {
+            self.csrs.mip |= MIP_SEIP;
         }
     }
 
@@ -2802,7 +2802,8 @@ mod tests {
         let instruction = 0x0010_0093_u32; // addi x1, x0, 1
         bus.write_u16(low_page + PAGE_SIZE - 2, instruction as u16)
             .unwrap();
-        bus.write_u16(high_page, (instruction >> 16) as u16).unwrap();
+        bus.write_u16(high_page, (instruction >> 16) as u16)
+            .unwrap();
 
         cpu.privilege_mode = PrivilegeMode::Supervisor;
         cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
@@ -3012,6 +3013,35 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MCAUSE), INTERRUPT_BIT | INTERRUPT_MACHINE_TIMER);
         assert_eq!(cpu.csr(CSR_MTVAL), 0);
         assert_eq!(cpu.csr(CSR_MIP) & MIP_MTIP, MIP_MTIP);
+        assert_eq!(cpu.register(1), 0);
+        assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    #[test]
+    fn enabled_machine_external_interrupt_enters_trap_before_fetch() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        let vector = DRAM_START + 64;
+        cpu.csrs.mtvec = vector;
+        cpu.csrs.mstatus = MSTATUS_MIE;
+        cpu.csrs.mie = MIP_MEIP;
+        bus.push_uart_input(b"X");
+        bus.write_u8(crate::bus::UART_START + 1, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 10 * 4, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 0x2000, 1 << 10)
+            .unwrap();
+        bus.write_u32(DRAM_START, 0x0010_8093).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.csr(CSR_MEPC), DRAM_START);
+        assert_eq!(
+            cpu.csr(CSR_MCAUSE),
+            INTERRUPT_BIT | INTERRUPT_MACHINE_EXTERNAL
+        );
+        assert_eq!(cpu.csr(CSR_MTVAL), 0);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_MEIP, MIP_MEIP);
         assert_eq!(cpu.register(1), 0);
         assert_eq!(cpu.csr(CSR_INSTRET), 0);
     }

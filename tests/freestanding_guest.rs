@@ -52,6 +52,13 @@ fn compiles_and_runs_a_supervisor_trap_guest() {
 }
 
 #[test]
+fn compiles_and_runs_a_plic_uart_interrupt_guest() {
+    let result = compile_and_run_guest_with_march("plic", "rv64im_zicsr", b"P", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"P");
+}
+
+#[test]
 fn compiles_and_runs_an_sv39_guest() {
     let result = compile_and_run_guest_with_march("sv39", "rv64im_zicsr", b"", 100_000);
     assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });

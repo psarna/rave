@@ -18,7 +18,12 @@ use rave::decode_helpers::{
 };
 use rave::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
-    Machine, StopReason, REGISTER_NAMES,
+    Machine, StopReason, MSIP_REGISTER_INDEX, MTIMECMP_REGISTER_INDEX, MTIME_REGISTER_INDEX,
+    PC_REGISTER_INDEX, PLIC_MACHINE_CLAIM_REGISTER_INDEX, PLIC_MACHINE_ENABLE_REGISTER_INDEX,
+    PLIC_MACHINE_THRESHOLD_REGISTER_INDEX, PLIC_PENDING_REGISTER_INDEX,
+    PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX, PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX,
+    PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX, PLIC_UART_PRIORITY_REGISTER_INDEX, REGISTER_NAMES,
+    SATP_REGISTER_INDEX, UART_IER_REGISTER_INDEX,
 };
 use std::collections::BTreeSet;
 use std::io::{self, stdout};
@@ -27,13 +32,9 @@ use std::time::{Duration, Instant};
 const HELP: &str =
     "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | F7 page tables/code | PgUp/PgDown scroll | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
-const PC_INDEX: usize = 32;
-const MSIP_INDEX: usize = 33;
-const MTIME_INDEX: usize = 34;
-const MTIMECMP_INDEX: usize = 35;
-const SATP_INDEX: usize = 36;
-const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_INDEX;
-const LAST_EDITABLE_INDEX: usize = MTIMECMP_INDEX;
+const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_REGISTER_INDEX;
+const LAST_PSEUDO_REGISTER_INDEX: usize = SATP_REGISTER_INDEX;
+const LAST_SELECTABLE_INDEX: usize = SATP_REGISTER_INDEX;
 const INSTRUCTION_SIZE: u64 = 4;
 const MOUSE_WHEEL_CODE_ROWS: i64 = 3;
 const PANEL_BORDER_HEIGHT: u16 = 2;
@@ -44,7 +45,7 @@ const INSTRUCTION_SRET: u32 = 0x1020_0073;
 const CSR_MTVEC: u16 = 0x305;
 const CSR_MEPC: u16 = 0x341;
 const CSR_SEPC: u16 = 0x141;
-const REGISTER_NAME_WIDTH: u16 = 8;
+const REGISTER_NAME_WIDTH: u16 = 12;
 const REGISTER_VALUE_WIDTH: u16 = 18;
 const REGISTER_TABLE_DECORATION_WIDTH: u16 = 6;
 const REGISTER_PANE_WIDTH: u16 =
@@ -416,10 +417,10 @@ fn handle_register_key(key: KeyEvent, debugger: &mut Debugger, app: &mut App) {
             app.selected_register = app.selected_register.saturating_sub(1)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.selected_register = (app.selected_register + 1).min(LAST_EDITABLE_INDEX)
+            app.selected_register = (app.selected_register + 1).min(LAST_SELECTABLE_INDEX)
         }
         KeyCode::Home => app.selected_register = 0,
-        KeyCode::End => app.selected_register = LAST_EDITABLE_INDEX,
+        KeyCode::End => app.selected_register = LAST_SELECTABLE_INDEX,
         KeyCode::Enter | KeyCode::Char('e') => {
             app.edit_value = format!("0x{:x}", selected_value(debugger, app.selected_register));
             app.mode = Mode::RegisterEdit;
@@ -1253,8 +1254,8 @@ fn draw_right_column(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app
 }
 
 fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
-    let rows = (0..=PC_INDEX).map(|index| editable_row(debugger, app, index));
-    let selected = (app.selected_register <= PC_INDEX).then_some(app.selected_register);
+    let rows = (0..=PC_REGISTER_INDEX).map(|index| editable_row(debugger, app, index));
+    let selected = (app.selected_register <= PC_REGISTER_INDEX).then_some(app.selected_register);
     let mut state = TableState::default().with_selected(selected);
     let title = register_pane_title(debugger, app);
     let table = editable_table(rows, ["register", "value"])
@@ -1263,9 +1264,10 @@ fn draw_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &
 }
 
 fn draw_pseudo_registers(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &App) {
-    let rows =
-        (FIRST_PSEUDO_REGISTER_INDEX..=SATP_INDEX).map(|index| editable_row(debugger, app, index));
-    let selected = (app.selected_register >= FIRST_PSEUDO_REGISTER_INDEX)
+    let rows = (FIRST_PSEUDO_REGISTER_INDEX..=LAST_PSEUDO_REGISTER_INDEX)
+        .map(|index| editable_row(debugger, app, index));
+    let selected = (FIRST_PSEUDO_REGISTER_INDEX..=LAST_PSEUDO_REGISTER_INDEX)
+        .contains(&app.selected_register)
         .then(|| app.selected_register - FIRST_PSEUDO_REGISTER_INDEX);
     let mut state = TableState::default().with_selected(selected);
     let table = editable_table_without_header(rows).block(
@@ -1381,22 +1383,42 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn selected_value(debugger: &Debugger, index: usize) -> u64 {
     match index {
-        PC_INDEX => debugger.machine.cpu.pc,
-        MSIP_INDEX => debugger.machine.bus.msip(),
-        MTIME_INDEX => debugger.machine.bus.mtime(),
-        MTIMECMP_INDEX => debugger.machine.bus.mtimecmp(),
-        SATP_INDEX => debugger.machine.cpu.csr(0x180),
+        PC_REGISTER_INDEX => debugger.machine.cpu.pc,
+        MSIP_REGISTER_INDEX => debugger.machine.bus.msip(),
+        MTIME_REGISTER_INDEX => debugger.machine.bus.mtime(),
+        MTIMECMP_REGISTER_INDEX => debugger.machine.bus.mtimecmp(),
+        UART_IER_REGISTER_INDEX => debugger.machine.bus.uart_interrupt_enable(),
+        PLIC_UART_PRIORITY_REGISTER_INDEX => debugger.machine.bus.plic_uart_priority(),
+        PLIC_PENDING_REGISTER_INDEX => debugger.machine.bus.plic_pending(),
+        PLIC_MACHINE_ENABLE_REGISTER_INDEX => debugger.machine.bus.plic_machine_enable(),
+        PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX => debugger.machine.bus.plic_supervisor_enable(),
+        PLIC_MACHINE_THRESHOLD_REGISTER_INDEX => debugger.machine.bus.plic_machine_threshold(),
+        PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX => {
+            debugger.machine.bus.plic_supervisor_threshold()
+        }
+        PLIC_MACHINE_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_machine_claim(),
+        PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_supervisor_claim(),
+        SATP_REGISTER_INDEX => debugger.machine.cpu.csr(0x180),
         _ => debugger.machine.cpu.register(index),
     }
 }
 
 fn register_label(index: usize) -> String {
     match index {
-        PC_INDEX => "pc".into(),
-        MSIP_INDEX => "msip".into(),
-        MTIME_INDEX => "mtime".into(),
-        MTIMECMP_INDEX => "mtimecmp".into(),
-        SATP_INDEX => "satp".into(),
+        PC_REGISTER_INDEX => "pc".into(),
+        MSIP_REGISTER_INDEX => "msip".into(),
+        MTIME_REGISTER_INDEX => "mtime".into(),
+        MTIMECMP_REGISTER_INDEX => "mtimecmp".into(),
+        UART_IER_REGISTER_INDEX => "uart_ier".into(),
+        PLIC_UART_PRIORITY_REGISTER_INDEX => "plic_prio".into(),
+        PLIC_PENDING_REGISTER_INDEX => "plic_pending".into(),
+        PLIC_MACHINE_ENABLE_REGISTER_INDEX => "plic_menable".into(),
+        PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX => "plic_senable".into(),
+        PLIC_MACHINE_THRESHOLD_REGISTER_INDEX => "plic_mthresh".into(),
+        PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX => "plic_sthresh".into(),
+        PLIC_MACHINE_CLAIM_REGISTER_INDEX => "plic_mclaim".into(),
+        PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => "plic_sclaim".into(),
+        SATP_REGISTER_INDEX => "satp".into(),
         _ => format!("x{index:<2} {}", REGISTER_NAMES[index]),
     }
 }
@@ -1438,11 +1460,30 @@ fn record_and_set(debugger: &mut Debugger, app: &mut App, index: usize, value: u
 
 fn set_value(debugger: &mut Debugger, index: usize, value: u64) {
     match index {
-        PC_INDEX => debugger.machine.cpu.pc = value,
-        MSIP_INDEX => debugger.machine.bus.set_msip(value),
-        MTIME_INDEX => debugger.machine.bus.set_mtime(value),
-        MTIMECMP_INDEX => debugger.machine.bus.set_mtimecmp(value),
-        SATP_INDEX => {} // read-only in the pane; never fall through to registers
+        PC_REGISTER_INDEX => debugger.machine.cpu.pc = value,
+        MSIP_REGISTER_INDEX => debugger.machine.bus.set_msip(value),
+        MTIME_REGISTER_INDEX => debugger.machine.bus.set_mtime(value),
+        MTIMECMP_REGISTER_INDEX => debugger.machine.bus.set_mtimecmp(value),
+        UART_IER_REGISTER_INDEX => debugger.machine.bus.set_uart_interrupt_enable(value),
+        PLIC_UART_PRIORITY_REGISTER_INDEX => debugger.machine.bus.set_plic_uart_priority(value),
+        PLIC_PENDING_REGISTER_INDEX => {}
+        PLIC_MACHINE_ENABLE_REGISTER_INDEX => debugger.machine.bus.set_plic_machine_enable(value),
+        PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX => {
+            debugger.machine.bus.set_plic_supervisor_enable(value)
+        }
+        PLIC_MACHINE_THRESHOLD_REGISTER_INDEX => {
+            debugger.machine.bus.set_plic_machine_threshold(value)
+        }
+        PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX => {
+            debugger.machine.bus.set_plic_supervisor_threshold(value);
+        }
+        PLIC_MACHINE_CLAIM_REGISTER_INDEX => {
+            debugger.machine.bus.complete_plic_machine_claim(value)
+        }
+        PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => {
+            debugger.machine.bus.complete_plic_supervisor_claim(value);
+        }
+        SATP_REGISTER_INDEX => {} // read-only in the pane; never fall through to registers
         _ if index < REGISTER_NAMES.len() => debugger.machine.cpu.set_register(index, value),
         _ => {}
     }
@@ -1623,7 +1664,6 @@ fn branch_info(instruction: u32, address: u64, debugger: &Debugger) -> Option<Br
     })
 }
 
-
 fn branch_spans<'a>(branch: &BranchInfo, base: Style, debugger: &Debugger) -> Vec<Span<'a>> {
     let lhs = debugger.machine.cpu.register(branch.rs1);
     let rhs = debugger.machine.cpu.register(branch.rs2);
@@ -1681,9 +1721,6 @@ fn branch_arrow(address: u64, source: u64, target: u64, first: u64, last: u64) -
 }
 
 // Jump decoding helpers
-
-
-
 
 fn decode_upper(instruction: u32, address: u64) -> Option<UpperInfo> {
     let rd = ((instruction >> 7) & 0x1f) as usize;
@@ -2095,18 +2132,6 @@ fn decode_csr(instruction: u32, debugger: &Debugger) -> Option<CsrInfo> {
     })
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
     let opcode = instruction & 0x7f;
     let rd = ((instruction >> 7) & 0x1f) as usize;
@@ -2288,7 +2313,7 @@ mod tests {
         let mut app = App::new();
 
         record_and_set(&mut debugger, &mut app, 10, 0x55);
-        record_and_set(&mut debugger, &mut app, PC_INDEX, 0x8000_1000);
+        record_and_set(&mut debugger, &mut app, PC_REGISTER_INDEX, 0x8000_1000);
         undo_last_edit(&mut debugger, &mut app);
         assert_eq!(debugger.machine.cpu.pc, Machine::LOAD_ADDRESS);
         undo_last_edit(&mut debugger, &mut app);
@@ -2299,15 +2324,52 @@ mod tests {
     fn timer_pseudo_registers_are_editable() {
         let mut debugger = debugger();
         let mut app = App::new();
-        record_and_set(&mut debugger, &mut app, MSIP_INDEX, 1);
-        record_and_set(&mut debugger, &mut app, MTIME_INDEX, 12);
-        record_and_set(&mut debugger, &mut app, MTIMECMP_INDEX, 34);
+        record_and_set(&mut debugger, &mut app, MSIP_REGISTER_INDEX, 1);
+        record_and_set(&mut debugger, &mut app, MTIME_REGISTER_INDEX, 12);
+        record_and_set(&mut debugger, &mut app, MTIMECMP_REGISTER_INDEX, 34);
 
         assert_eq!(debugger.machine.bus.msip(), 1);
         assert_eq!(debugger.machine.bus.mtime(), 12);
         assert_eq!(debugger.machine.bus.mtimecmp(), 34);
         undo_last_edit(&mut debugger, &mut app);
         assert_eq!(debugger.machine.bus.mtimecmp(), u64::MAX);
+    }
+
+    #[test]
+    fn platform_pseudo_registers_are_editable() {
+        let mut debugger = debugger();
+        let mut app = App::new();
+
+        record_and_set(&mut debugger, &mut app, UART_IER_REGISTER_INDEX, 1);
+        record_and_set(
+            &mut debugger,
+            &mut app,
+            PLIC_UART_PRIORITY_REGISTER_INDEX,
+            1,
+        );
+        record_and_set(
+            &mut debugger,
+            &mut app,
+            PLIC_MACHINE_ENABLE_REGISTER_INDEX,
+            1 << 10,
+        );
+        record_and_set(
+            &mut debugger,
+            &mut app,
+            PLIC_MACHINE_THRESHOLD_REGISTER_INDEX,
+            2,
+        );
+
+        assert_eq!(debugger.machine.bus.uart_interrupt_enable(), 1);
+        assert_eq!(debugger.machine.bus.plic_uart_priority(), 1);
+        assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
+        assert_eq!(debugger.machine.bus.plic_machine_threshold(), 2);
+        assert_eq!(
+            register_label(PLIC_MACHINE_CLAIM_REGISTER_INDEX),
+            "plic_mclaim"
+        );
+        undo_last_edit(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.bus.plic_machine_threshold(), 0);
     }
 
     #[test]
@@ -2461,7 +2523,7 @@ mod tests {
                 .unwrap();
 
             app.mode = Mode::RegisterSelect;
-            app.selected_register = MTIMECMP_INDEX;
+            app.selected_register = MTIMECMP_REGISTER_INDEX;
             terminal
                 .draw(|frame| draw(frame, &debugger, &mut app))
                 .unwrap();
@@ -2476,7 +2538,7 @@ mod tests {
 
     #[test]
     fn register_pane_is_only_as_wide_as_its_columns() {
-        assert_eq!(REGISTER_PANE_WIDTH, 32);
+        assert_eq!(REGISTER_PANE_WIDTH, 36);
         assert_eq!(REGISTER_VALUE_WIDTH, "0xffffffffffffffff".len() as u16);
         assert!(register_label(27).len() <= REGISTER_NAME_WIDTH as usize);
     }
