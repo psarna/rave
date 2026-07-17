@@ -34,6 +34,8 @@ receive data for the guest.
 
 ## Firmware and OS boot
 
+![boot](demo/opensbi.gif)
+
 The `boot` command loads OpenSBI at `0x8000_0000`, a kernel at
 `0x8020_0000`, and an 8-byte-aligned device tree near the top of guest RAM.
 It starts hart 0 with the standard firmware arguments (`a0 = 0`, `a1 = DTB`)
