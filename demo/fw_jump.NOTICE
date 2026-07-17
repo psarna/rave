@@ -1,0 +1,72 @@
+OpenSBI fw_jump.bin provenance
+================================
+
+demo/fw_jump.bin is OpenSBI 1.7 generic RV64 firmware built from the official
+upstream opensbi-1.7 source release. It is not authored by the rave project.
+
+Source release: https://github.com/riscv-software-src/opensbi/releases/tag/v1.7
+Source SHA-256: 2cf856a4e5e2e052948ddb54ba48232b1f698b7f52e0374fc7d17d51e8c8f7ce
+Binary SHA-256: ca3f272261a50a858dfba23a25b106905c028ccd570e9dbba924c64fca0b56c6
+
+The source tree was configured with demo/fw_jump.defconfig as the generic
+platform defconfig and built for RV64 with LLVM. The configuration deliberately
+excludes the generic platform's GPL-only Andes and Renesas modules. Every source
+file selected by this build is BSD-2-Clause or offers BSD-2-Clause as an option.
+
+Upstream build command (after copying fw_jump.defconfig to
+platform/generic/configs/rave):
+
+    make LLVM=1 PLATFORM=generic PLATFORM_DEFCONFIG=rave PLATFORM_RISCV_XLEN=64
+
+Copyright notices from the selected source files include:
+
+Copyright (C) 2006 David Gibson, IBM Corporation.
+Copyright (C) 2012 David Gibson, IBM Corporation.
+Copyright (C) 2014 David Gibson <david@gibson.dropbear.id.au>
+Copyright (C) 2018 embedded brains GmbH
+Copyright (C) 2020 Bin Meng <bmeng.cn@gmail.com>
+Copyright (c) 2019 Western Digital Corporation or its affiliates.
+Copyright (c) 2020 Western Digital Corporation or its affiliates.
+Copyright (c) 2021 Christoph Müllner <cmuellner@linux.com>
+Copyright (c) 2021 Western Digital Corporation or its affiliates.
+Copyright (c) 2022 Ventana Micro Systems Inc.
+Copyright (c) 2023 Rivos Systems Inc.
+Copyright (c) 2023 Rivos Systems.
+Copyright (c) 2023 Ventana Micro System, Inc.
+Copyright (c) 2023 Ventana Micro Systems Inc.
+Copyright (c) 2023 Ventana Micro Systems, Inc.
+Copyright (c) 2024 Rivos Inc.
+Copyright (c) 2024 SiFive
+Copyright (c) 2024 SiFive Inc.
+Copyright (c) 2024 Ventana Micro Systems Inc.
+Copyright (c) 2025 MIPS
+Copyright (c) 2025 Rivos Inc.
+Copyright (c) 2025 SiFive
+Copyright (c) IPADS@SJTU 2023. All rights reserved.
+Copyright 2012 Kim Phillips, Freescale Semiconductor.
+
+The 2-Clause BSD License
+SPDX short identifier: BSD-2-Clause
+
+Copyright (c) 2019 Western Digital Corporation or its affiliates and other
+contributors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

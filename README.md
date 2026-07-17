@@ -41,7 +41,7 @@ and streams UART output while the guest runs:
 
 ```sh
 cargo run --release -- boot \
-  --firmware path/to/fw_jump.bin \
+  --firmware demo/fw_jump.bin \
   --kernel path/to/Image \
   --dtb demo/rave.dtb \
   --memory 128M
@@ -60,6 +60,14 @@ dtc -I dts -O dtb -o demo/rave.dtb demo/rave.dts
 Add `--interactive` after `boot` to inspect OpenSBI and its payload in the TUI.
 The debugger's `start` command restores all three boot images and the firmware
 register contract.
+
+`demo/fw_jump.bin` is real OpenSBI 1.7 firmware, not a rave reimplementation.
+It was built from the official upstream release with a small generic
+configuration containing only the BSD-licensed drivers needed by rave. This
+avoids pulling unrelated GPL platform modules into the binary. Its SHA-256 is
+`ca3f272261a50a858dfba23a25b106905c028ccd570e9dbba924c64fca0b56c6`.
+See `demo/fw_jump.NOTICE` for provenance and redistribution terms, and
+`demo/fw_jump.defconfig` for the exact OpenSBI configuration.
 
 ## Debugging HQ
 
@@ -144,15 +152,19 @@ OpenSBI handoff payload demo:
 
 ```sh
 cargo run -- boot --interactive \
-  --firmware demo/boot_shim.bin \
+  --firmware demo/fw_jump.bin \
   --kernel demo/boot_payload.bin \
   --dtb demo/rave.dtb
 ```
 
-Continue execution to see the minimal M-mode shim enter the demo in supervisor
-mode. The payload prints `B` and waits with `wfi`, leaving the machine available
-for inspection. Substitute an OpenSBI `fw_jump.bin` for `demo/boot_shim.bin` to
-exercise the complete SBI firmware initialization path.
+Continue execution to watch the bundled production OpenSBI firmware initialize
+the platform and enter the demo in supervisor mode. The payload prints
+`uart echo ready` and waits for UART lines. Press F6, enter text, and submit it
+to receive `got: <text>`.
+
+For a much smaller, readable illustration of the same machine-to-supervisor
+handoff, substitute `demo/boot_shim.bin`. That shim is a rave test fixture, not
+OpenSBI and not a general-purpose SBI implementation.
 
 Auto tests:
 ```sh

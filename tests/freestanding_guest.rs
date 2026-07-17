@@ -86,17 +86,18 @@ fn precompiled_privileged_demo_is_runnable() {
 }
 
 #[test]
-fn precompiled_boot_payload_reaches_its_wait_loop() {
+fn precompiled_boot_payload_echoes_a_uart_line() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let image = std::fs::read(root.join("demo/boot_payload.bin")).unwrap();
     let mut machine = Machine::from_raw(&image, Machine::KERNEL_ADDRESS, 4 * 1024 * 1024).unwrap();
-    for _ in 0..100 {
+    machine.bus.push_uart_input(b"Ada\n");
+    for _ in 0..1_000 {
         assert_eq!(machine.step().unwrap(), None);
-        if machine.bus.uart_output() == b"B\n" {
+        if machine.bus.uart_output() == b"uart echo ready\ngot: Ada\n" {
             break;
         }
     }
-    assert_eq!(machine.bus.uart_output(), b"B\n");
+    assert_eq!(machine.bus.uart_output(), b"uart echo ready\ngot: Ada\n");
 }
 
 #[test]
@@ -107,9 +108,10 @@ fn precompiled_boot_demo_hands_off_to_supervisor_mode() {
     let device_tree = std::fs::read(root.join("demo/rave.dtb")).unwrap();
     let mut machine =
         Machine::from_boot(&firmware, &kernel, &device_tree, 128 * 1024 * 1024).unwrap();
-    for _ in 0..100 {
+    machine.bus.push_uart_input(b"Grace\n");
+    for _ in 0..1_000 {
         assert_eq!(machine.step().unwrap(), None);
-        if machine.bus.uart_output() == b"B\n" {
+        if machine.bus.uart_output() == b"uart echo ready\ngot: Grace\n" {
             break;
         }
     }
@@ -117,7 +119,43 @@ fn precompiled_boot_demo_hands_off_to_supervisor_mode() {
         machine.cpu.privilege_mode(),
         rave::PrivilegeMode::Supervisor
     );
-    assert_eq!(machine.bus.uart_output(), b"B\n");
+    assert_eq!(machine.bus.uart_output(), b"uart echo ready\ngot: Grace\n");
+}
+
+#[test]
+fn bundled_opensbi_hands_off_to_echo_payload() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let firmware = std::fs::read(root.join("demo/fw_jump.bin")).unwrap();
+    let kernel = std::fs::read(root.join("demo/boot_payload.bin")).unwrap();
+    let device_tree = std::fs::read(root.join("demo/rave.dtb")).unwrap();
+    let mut machine =
+        Machine::from_boot(&firmware, &kernel, &device_tree, 128 * 1024 * 1024).unwrap();
+
+    for _ in 0..10_000_000 {
+        assert_eq!(machine.step().unwrap(), None);
+        if machine.bus.uart_output().ends_with(b"uart echo ready\n") {
+            break;
+        }
+    }
+    assert!(machine
+        .bus
+        .uart_output()
+        .windows(b"OpenSBI v1.7".len())
+        .any(|window| window == b"OpenSBI v1.7"));
+    assert!(machine.bus.uart_output().ends_with(b"uart echo ready\n"));
+    assert_eq!(
+        machine.cpu.privilege_mode(),
+        rave::PrivilegeMode::Supervisor
+    );
+
+    machine.bus.push_uart_input(b"Linus\n");
+    for _ in 0..10_000 {
+        assert_eq!(machine.step().unwrap(), None);
+        if machine.bus.uart_output().ends_with(b"got: Linus\n") {
+            break;
+        }
+    }
+    assert!(machine.bus.uart_output().ends_with(b"got: Linus\n"));
 }
 
 #[test]
