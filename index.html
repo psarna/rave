@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>rave — RISC-V in the browser</title>
+    <link rel="stylesheet" href="./web/style.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand">
+          <img class="logo" src="./demo/rave.png" alt="rave">
+          <div>
+            <p class="eyebrow">RV64IMAC emulator</p>
+            <h1>rave in your browser</h1>
+            <p class="subtitle">Boot firmware and a kernel, then talk to the guest over its emulated 16550 UART.</p>
+          </div>
+        </div>
+        <div class="status"><span></span><output id="status">stopped</output></div>
+      </header>
+
+      <section class="controls" aria-label="Boot configuration">
+        <label>Mode
+          <select id="mode">
+            <option value="boot">Firmware + kernel</option>
+            <option value="raw">Raw demo</option>
+          </select>
+        </label>
+        <div id="boot-options" class="option-grid">
+          <label>Firmware
+            <select id="firmware"></select>
+            <input id="firmware-upload" type="file" aria-label="Upload custom firmware">
+          </label>
+          <label>Kernel / payload
+            <select id="kernel"></select>
+            <input id="kernel-upload" type="file" aria-label="Upload custom kernel">
+          </label>
+        </div>
+        <div id="raw-options" class="option-grid" hidden>
+          <label>Guest image
+            <select id="raw"></select>
+            <input id="raw-upload" type="file" aria-label="Upload custom raw guest">
+          </label>
+        </div>
+        <div class="buttons">
+          <button id="run" class="primary">Boot</button>
+          <button id="stop">Stop</button>
+          <button id="clear">Clear terminal</button>
+        </div>
+      </section>
+
+      <div class="runtime">
+        <section class="terminal-shell">
+          <div class="terminal-bar">
+            <span>UART0 · 16550</span>
+          </div>
+          <pre id="terminal" tabindex="0" aria-label="UART terminal output"></pre>
+          <form id="uart-form" class="uart-input-row">
+            <label for="uart-input">UART input</label>
+            <span aria-hidden="true">›</span>
+            <input id="uart-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a line and press Enter">
+            <button type="submit">Send</button>
+          </form>
+        </section>
+
+        <aside class="register-panel" aria-label="Live registers">
+          <div class="register-bar">
+            <span>Registers</span>
+            <span>Live</span>
+          </div>
+          <div id="register-list" class="register-list">
+            <p>Boot a guest to inspect its state.</p>
+          </div>
+        </aside>
+      </div>
+
+      <p class="note">Custom boot images use the bundled 128 MiB device tree. No files leave your browser.</p>
+    </main>
+    <script defer src="./web/app.js"></script>
+  </body>
+</html>

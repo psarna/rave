@@ -1,0 +1,15 @@
+{
+  "name": "rave",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "rave_bg.wasm",
+    "rave.js",
+    "rave.d.ts"
+  ],
+  "main": "rave.js",
+  "types": "rave.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

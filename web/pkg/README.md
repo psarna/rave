@@ -192,7 +192,10 @@ Install `wasm-pack`, then build and serve the repository root:
 python3 -m http.server 8000
 ```
 
-... or just enjoy https://rave.sarna.dev
+Open `http://localhost:8000/`. The site must be served over HTTP rather
+than opened with `file://`, because it fetches the WASM and guest images. A
+GitHub Pages can publish the repository root directly; the root `index.html`
+loads `web/`, `demo/`, and the generated `web/pkg/` directory.
 
 Virtio is not implemented yet. The firmware boot path is present, while full
 Linux compatibility may still expose privileged-architecture gaps that are not
