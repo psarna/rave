@@ -83,8 +83,12 @@ Launch the interactive debugger with:
 cargo run -- --interactive path/to/guest.bin
 ```
 
-The debugger accepts `start`, `step`, `next`, `break ADDR`, `continue`, and `uart TEXT`
-(`r`, `s`, `n`, `b`, and `c` aliases are available). Use Tab to select the
+The debugger accepts `start`, `step`/`stepi`, `next`/`nexti`, `break ADDR`,
+`continue`, and `uart TEXT` (`r`, `s`/`si`, `n`/`ni`, `b`, and `c` aliases are
+available). `stepi` executes exactly one instruction. Like GDB, `nexti` also
+executes one instruction unless it is a call, in which case execution continues
+until the call returns, a user breakpoint is reached, UART input is needed, or
+the guest halts. Use Tab to select the
 register pane, arrow keys to choose a register, and Enter to edit it. F5, F10,
 and F11 provide continue, next, and step shortcuts; F6 opens UART input.
 

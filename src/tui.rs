@@ -32,7 +32,7 @@ use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
 const HELP: &str =
-    "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | F7 page tables/code | PgUp/PgDown scroll | quit(q)";
+    "start | step/stepi(s/si) | next/nexti(n/ni) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | F7 page tables/code | PgUp/PgDown scroll | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_REGISTER_INDEX;
 const LAST_PSEUDO_REGISTER_INDEX: usize = SCOUNTEREN_REGISTER_INDEX;
@@ -606,6 +606,9 @@ fn format_stop(reason: StopReason) -> String {
     match reason {
         StopReason::Started => "program reset at entry point".into(),
         StopReason::Stepped => "executed one instruction".into(),
+        StopReason::SteppedOverCall { instructions } => {
+            format!("stepped over call ({instructions} instructions)")
+        }
         StopReason::Breakpoint(address) => format!("breakpoint hit at {address:#018x}"),
         StopReason::UartInput => "guest is waiting for UART input".into(),
         StopReason::Halted(reason) => format!("guest halted: {reason:?}"),

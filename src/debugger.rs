@@ -179,6 +179,7 @@ pub fn parse_register(name: &str) -> Result<usize, CommandError> {
 pub enum StopReason {
     Started,
     Stepped,
+    SteppedOverCall { instructions: u64 },
     Breakpoint(u64),
     UartInput,
     Halted(HaltReason),
@@ -287,27 +288,34 @@ impl Debugger {
         let Some(return_address) = self.call_return_address() else {
             return self.step();
         };
+        if instruction_limit == 0 {
+            return Err(MachineError::InstructionLimit(0));
+        }
         let first = self.step()?;
         if first != StopReason::Stepped {
             return Ok(first);
         }
-        for _ in 0..instruction_limit {
+        let mut instructions = 1;
+        loop {
             let pc = self.machine.cpu.pc;
-            if pc == return_address {
-                return Ok(StopReason::Stepped);
-            }
             if self.breakpoints.contains(&pc) {
                 self.skip_current_breakpoint = true;
                 return Ok(StopReason::Breakpoint(pc));
             }
+            if pc == return_address {
+                return Ok(StopReason::SteppedOverCall { instructions });
+            }
+            if instructions == instruction_limit {
+                return Err(MachineError::InstructionLimit(instruction_limit));
+            }
             if let Some(reason) = self.machine.step()? {
                 return Ok(StopReason::Halted(reason));
             }
+            instructions += 1;
             if self.should_stop_for_uart_input() {
                 return Ok(StopReason::UartInput);
             }
         }
-        Err(MachineError::InstructionLimit(instruction_limit))
     }
 
     /// Returns the sequential return address if the current instruction is a
@@ -573,7 +581,10 @@ mod tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         let mut debugger = Debugger::new(&image, DRAM_START, 4096).unwrap();
-        assert_eq!(debugger.next(100).unwrap(), StopReason::Stepped);
+        assert_eq!(
+            debugger.next(100).unwrap(),
+            StopReason::SteppedOverCall { instructions: 3 }
+        );
         assert_eq!(debugger.machine.cpu.pc, DRAM_START + 4);
         assert_eq!(debugger.machine.cpu.register(6), 1);
     }
@@ -584,6 +595,35 @@ mod tests {
         assert_eq!(debugger.next(100).unwrap(), StopReason::Stepped);
         assert_eq!(debugger.machine.cpu.pc, DRAM_START + 4);
         assert_eq!(debugger.machine.cpu.register(1), 1);
+    }
+
+    #[test]
+    fn next_counts_the_call_instruction_toward_its_limit() {
+        // jal ra, 0 loops forever while continually overwriting ra.
+        let image = 0x0000_00ef_u32.to_le_bytes();
+        let mut debugger = Debugger::new(&image, DRAM_START, 4096).unwrap();
+        assert!(matches!(
+            debugger.next(1),
+            Err(MachineError::InstructionLimit(1))
+        ));
+        assert_eq!(debugger.machine.cpu.pc, DRAM_START);
+    }
+
+    #[test]
+    fn next_reports_a_user_breakpoint_at_the_call_return_address() {
+        // jal ra, +8; ebreak; jalr x0, 0(ra)
+        let instructions = [0x0080_00ef_u32, 0x0010_0073, 0x0000_8067];
+        let image: Vec<u8> = instructions
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut debugger = Debugger::new(&image, DRAM_START, 4096).unwrap();
+        debugger.breakpoints.insert(DRAM_START + 4);
+
+        assert_eq!(
+            debugger.next(100).unwrap(),
+            StopReason::Breakpoint(DRAM_START + 4)
+        );
     }
 
     #[test]
