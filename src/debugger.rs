@@ -18,6 +18,9 @@ pub const PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX: usize = 42;
 pub const PLIC_MACHINE_CLAIM_REGISTER_INDEX: usize = 43;
 pub const PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX: usize = 44;
 pub const SATP_REGISTER_INDEX: usize = 45;
+pub const MSTATUS_REGISTER_INDEX: usize = 46;
+pub const MCOUNTEREN_REGISTER_INDEX: usize = 47;
+pub const SCOUNTEREN_REGISTER_INDEX: usize = 48;
 
 pub const REGISTER_NAMES: [&str; 32] = [
     "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
@@ -147,6 +150,9 @@ pub fn parse_register(name: &str) -> Result<usize, CommandError> {
         "plic_mclaim" => return Ok(PLIC_MACHINE_CLAIM_REGISTER_INDEX),
         "plic_sclaim" => return Ok(PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX),
         "satp" => return Ok(SATP_REGISTER_INDEX),
+        "mstatus" => return Ok(MSTATUS_REGISTER_INDEX),
+        "mcounteren" => return Ok(MCOUNTEREN_REGISTER_INDEX),
+        "scounteren" => return Ok(SCOUNTEREN_REGISTER_INDEX),
         _ => {}
     }
     if let Some(index) = REGISTER_NAMES
@@ -177,21 +183,75 @@ pub enum StopReason {
 
 pub struct Debugger {
     pub machine: Machine,
-    image: Vec<u8>,
-    load_address: u64,
-    memory_size: usize,
+    layout: ImageLayout,
     breakpoints: BTreeSet<u64>,
     skip_current_breakpoint: bool,
     uart_wait_output_len: Option<usize>,
 }
 
+enum ImageLayout {
+    Raw {
+        image: Vec<u8>,
+        load_address: u64,
+        memory_size: usize,
+    },
+    Boot {
+        firmware: Vec<u8>,
+        kernel: Vec<u8>,
+        device_tree: Vec<u8>,
+        memory_size: usize,
+    },
+}
+
+impl ImageLayout {
+    fn machine(&self) -> Result<Machine, MachineError> {
+        match self {
+            Self::Raw {
+                image,
+                load_address,
+                memory_size,
+            } => Machine::from_raw(image, *load_address, *memory_size),
+            Self::Boot {
+                firmware,
+                kernel,
+                device_tree,
+                memory_size,
+            } => Machine::from_boot(firmware, kernel, device_tree, *memory_size),
+        }
+    }
+}
+
 impl Debugger {
     pub fn new(image: &[u8], load_address: u64, memory_size: usize) -> Result<Self, MachineError> {
-        Ok(Self {
-            machine: Machine::from_raw(image, load_address, memory_size)?,
+        let layout = ImageLayout::Raw {
             image: image.to_vec(),
             load_address,
             memory_size,
+        };
+        Ok(Self {
+            machine: layout.machine()?,
+            layout,
+            breakpoints: BTreeSet::new(),
+            skip_current_breakpoint: false,
+            uart_wait_output_len: None,
+        })
+    }
+
+    pub fn from_boot(
+        firmware: &[u8],
+        kernel: &[u8],
+        device_tree: &[u8],
+        memory_size: usize,
+    ) -> Result<Self, MachineError> {
+        let layout = ImageLayout::Boot {
+            firmware: firmware.to_vec(),
+            kernel: kernel.to_vec(),
+            device_tree: device_tree.to_vec(),
+            memory_size,
+        };
+        Ok(Self {
+            machine: layout.machine()?,
+            layout,
             breakpoints: BTreeSet::new(),
             skip_current_breakpoint: false,
             uart_wait_output_len: None,
@@ -203,7 +263,7 @@ impl Debugger {
     }
 
     pub fn start(&mut self) -> Result<StopReason, MachineError> {
-        self.machine = Machine::from_raw(&self.image, self.load_address, self.memory_size)?;
+        self.machine = self.layout.machine()?;
         self.skip_current_breakpoint = false;
         self.uart_wait_output_len = None;
         Ok(StopReason::Started)
@@ -336,7 +396,18 @@ impl Debugger {
             PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => {
                 self.machine.bus.complete_plic_supervisor_claim(value);
             }
-            SATP_REGISTER_INDEX => {}
+            SATP_REGISTER_INDEX => {
+                self.machine.cpu.set_csr_for_debug(0x180, value);
+            }
+            MSTATUS_REGISTER_INDEX => {
+                self.machine.cpu.set_csr_for_debug(0x300, value);
+            }
+            MCOUNTEREN_REGISTER_INDEX => {
+                self.machine.cpu.set_csr_for_debug(0x306, value);
+            }
+            SCOUNTEREN_REGISTER_INDEX => {
+                self.machine.cpu.set_csr_for_debug(0x106, value);
+            }
             _ if index < REGISTER_NAMES.len() => self.machine.cpu.set_register(index, value),
             _ => {}
         }
@@ -409,6 +480,13 @@ mod tests {
                 value: 1
             })
         );
+        assert_eq!(
+            "set mcounteren 7".parse(),
+            Ok(Command::SetRegister {
+                index: MCOUNTEREN_REGISTER_INDEX,
+                value: 7
+            })
+        );
     }
 
     #[test]
@@ -433,9 +511,19 @@ mod tests {
                 10,
             )
             .unwrap();
+        debugger
+            .execute(
+                Command::SetRegister {
+                    index: MCOUNTEREN_REGISTER_INDEX,
+                    value: 7,
+                },
+                10,
+            )
+            .unwrap();
 
         assert_eq!(debugger.machine.bus.uart_interrupt_enable(), 1);
         assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
+        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
     }
 
     #[test]
@@ -504,5 +592,31 @@ mod tests {
         assert_eq!(debugger.machine.cpu.pc, DRAM_START);
         assert_eq!(debugger.machine.cpu.register(1), 0);
         assert_eq!(debugger.machine.cpu.register(10), 0);
+    }
+
+    #[test]
+    fn boot_debugger_start_restores_the_multi_image_layout() {
+        let firmware = 0x0010_0073_u32.to_le_bytes();
+        let kernel = [1, 2, 3, 4];
+        let device_tree = [5, 6, 7, 8];
+        let mut debugger =
+            Debugger::from_boot(&firmware, &kernel, &device_tree, 4 * 1024 * 1024).unwrap();
+        let dtb_address = debugger.machine.cpu.register(11);
+
+        debugger.machine.cpu.set_register(10, 99);
+        debugger
+            .machine
+            .bus
+            .write_u32(Machine::KERNEL_ADDRESS, 0)
+            .unwrap();
+        debugger.start().unwrap();
+
+        assert_eq!(debugger.machine.cpu.pc, Machine::FIRMWARE_ADDRESS);
+        assert_eq!(debugger.machine.cpu.register(10), 0);
+        assert_eq!(debugger.machine.cpu.register(11), dtb_address);
+        assert_eq!(
+            debugger.machine.bus.peek_u32(Machine::KERNEL_ADDRESS),
+            Ok(0x0403_0201)
+        );
     }
 }

@@ -18,12 +18,13 @@ use rave::decode_helpers::{
 };
 use rave::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
-    Machine, StopReason, MSIP_REGISTER_INDEX, MTIMECMP_REGISTER_INDEX, MTIME_REGISTER_INDEX,
-    PC_REGISTER_INDEX, PLIC_MACHINE_CLAIM_REGISTER_INDEX, PLIC_MACHINE_ENABLE_REGISTER_INDEX,
+    Machine, StopReason, MCOUNTEREN_REGISTER_INDEX, MSIP_REGISTER_INDEX, MSTATUS_REGISTER_INDEX,
+    MTIMECMP_REGISTER_INDEX, MTIME_REGISTER_INDEX, PC_REGISTER_INDEX,
+    PLIC_MACHINE_CLAIM_REGISTER_INDEX, PLIC_MACHINE_ENABLE_REGISTER_INDEX,
     PLIC_MACHINE_THRESHOLD_REGISTER_INDEX, PLIC_PENDING_REGISTER_INDEX,
     PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX, PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX,
     PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX, PLIC_UART_PRIORITY_REGISTER_INDEX, REGISTER_NAMES,
-    SATP_REGISTER_INDEX, UART_IER_REGISTER_INDEX,
+    SATP_REGISTER_INDEX, SCOUNTEREN_REGISTER_INDEX, UART_IER_REGISTER_INDEX,
 };
 use std::collections::BTreeSet;
 use std::io::{self, stdout};
@@ -33,13 +34,14 @@ const HELP: &str =
     "start | step(s) | next(n) | break(b) ADDR | continue(c) | uart TEXT | set REG VALUE | undo(u) | F7 page tables/code | PgUp/PgDown scroll | quit(q)";
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const FIRST_PSEUDO_REGISTER_INDEX: usize = MSIP_REGISTER_INDEX;
-const LAST_PSEUDO_REGISTER_INDEX: usize = SATP_REGISTER_INDEX;
-const LAST_SELECTABLE_INDEX: usize = SATP_REGISTER_INDEX;
+const LAST_PSEUDO_REGISTER_INDEX: usize = SCOUNTEREN_REGISTER_INDEX;
+const LAST_SELECTABLE_INDEX: usize = SCOUNTEREN_REGISTER_INDEX;
 const INSTRUCTION_SIZE: u64 = 4;
 const MOUSE_WHEEL_CODE_ROWS: i64 = 3;
 const PANEL_BORDER_HEIGHT: u16 = 2;
 const BRANCH_OPCODE: u32 = 0x63;
 const INSTRUCTION_ECALL: u32 = 0x0000_0073;
+const INSTRUCTION_EBREAK: u32 = 0x0010_0073;
 const INSTRUCTION_MRET: u32 = 0x3020_0073;
 const INSTRUCTION_SRET: u32 = 0x1020_0073;
 const CSR_MTVEC: u16 = 0x305;
@@ -237,7 +239,28 @@ impl App {
 }
 
 pub fn run(image: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut debugger = Debugger::new(image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE)?;
+    run_debugger(Debugger::new(
+        image,
+        Machine::LOAD_ADDRESS,
+        Machine::MEMORY_SIZE,
+    )?)
+}
+
+pub fn run_boot(
+    firmware: &[u8],
+    kernel: &[u8],
+    device_tree: &[u8],
+    memory_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_debugger(Debugger::from_boot(
+        firmware,
+        kernel,
+        device_tree,
+        memory_size,
+    )?)
+}
+
+fn run_debugger(mut debugger: Debugger) -> Result<(), Box<dyn std::error::Error>> {
     let _screen = ScreenGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -533,7 +556,7 @@ fn execute_command(input: &str, debugger: &mut Debugger, app: &mut App) {
     if let Command::SetRegister { index, .. } = command {
         app.edit_history.push(RegisterEdit {
             index,
-            previous_value: debugger.machine.cpu.register(index),
+            previous_value: selected_value(debugger, index),
         });
     }
     let description = match &command {
@@ -832,6 +855,32 @@ fn draw_code(frame: &mut Frame<'_>, area: Rect, debugger: &Debugger, app: &mut A
                                 base.patch(Style::default().fg(Color::Cyan)),
                             ),
                         ]);
+                    } else if let Some((rs1, rs2)) = decode_sfence_vma(instruction) {
+                        let address = if rs1 == 0 {
+                            "all addresses".to_string()
+                        } else {
+                            format!(
+                                "{}={:#x}",
+                                REGISTER_NAMES[rs1],
+                                debugger.machine.cpu.register(rs1)
+                            )
+                        };
+                        let asid = if rs2 == 0 {
+                            "all ASIDs".to_string()
+                        } else {
+                            format!(
+                                "{}={:#x}",
+                                REGISTER_NAMES[rs2],
+                                debugger.machine.cpu.register(rs2)
+                            )
+                        };
+                        spans.push(Span::styled(
+                            format!(
+                                "sfence.vma {},{} [{address}; {asid}]",
+                                REGISTER_NAMES[rs1], REGISTER_NAMES[rs2]
+                            ),
+                            base,
+                        ));
                     } else if let Some(csr) = decode_csr(instruction, debugger) {
                         let rd_name = if csr.rd == 0 {
                             "zero"
@@ -1399,6 +1448,9 @@ fn selected_value(debugger: &Debugger, index: usize) -> u64 {
         PLIC_MACHINE_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_machine_claim(),
         PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_supervisor_claim(),
         SATP_REGISTER_INDEX => debugger.machine.cpu.csr(0x180),
+        MSTATUS_REGISTER_INDEX => debugger.machine.cpu.csr(0x300),
+        MCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(0x306),
+        SCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(0x106),
         _ => debugger.machine.cpu.register(index),
     }
 }
@@ -1419,6 +1471,9 @@ fn register_label(index: usize) -> String {
         PLIC_MACHINE_CLAIM_REGISTER_INDEX => "plic_mclaim".into(),
         PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => "plic_sclaim".into(),
         SATP_REGISTER_INDEX => "satp".into(),
+        MSTATUS_REGISTER_INDEX => "mstatus".into(),
+        MCOUNTEREN_REGISTER_INDEX => "mcounteren".into(),
+        SCOUNTEREN_REGISTER_INDEX => "scounteren".into(),
         _ => format!("x{index:<2} {}", REGISTER_NAMES[index]),
     }
 }
@@ -1483,7 +1538,18 @@ fn set_value(debugger: &mut Debugger, index: usize, value: u64) {
         PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => {
             debugger.machine.bus.complete_plic_supervisor_claim(value);
         }
-        SATP_REGISTER_INDEX => {} // read-only in the pane; never fall through to registers
+        SATP_REGISTER_INDEX => {
+            debugger.machine.cpu.set_csr_for_debug(0x180, value);
+        }
+        MSTATUS_REGISTER_INDEX => {
+            debugger.machine.cpu.set_csr_for_debug(0x300, value);
+        }
+        MCOUNTEREN_REGISTER_INDEX => {
+            debugger.machine.cpu.set_csr_for_debug(0x306, value);
+        }
+        SCOUNTEREN_REGISTER_INDEX => {
+            debugger.machine.cpu.set_csr_for_debug(0x106, value);
+        }
         _ if index < REGISTER_NAMES.len() => debugger.machine.cpu.set_register(index, value),
         _ => {}
     }
@@ -1523,6 +1589,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x73 if instruction == 0x3020_0073 => "mret",
         0x73 if instruction == 0x1020_0073 => "sret",
         0x73 if instruction == 0x1050_0073 => "wfi",
+        0x73 if instruction & 0xfe00_7fff == 0x1200_0073 => "sfence.vma",
         0x73 => "system",
         _ => "unknown",
     }
@@ -1607,6 +1674,13 @@ fn code_flow(instruction: u32, address: u64, debugger: &Debugger) -> Option<Code
 
 fn decode_trap_flow(instruction: u32, debugger: &Debugger) -> Option<TrapFlowInfo> {
     match instruction {
+        INSTRUCTION_EBREAK if !debugger.machine.cpu.host_ebreak_exit_enabled() => {
+            Some(TrapFlowInfo {
+                mnemonic: "ebreak",
+                target_label: "mtvec",
+                target: debugger.machine.cpu.csr(CSR_MTVEC) & !0b11,
+            })
+        }
         INSTRUCTION_ECALL => Some(TrapFlowInfo {
             mnemonic: "ecall",
             target_label: "mtvec",
@@ -2052,6 +2126,7 @@ fn csr_name(address: u16) -> String {
         0x100 => "sstatus".into(),
         0x104 => "sie".into(),
         0x105 => "stvec".into(),
+        0x106 => "scounteren".into(),
         0x140 => "sscratch".into(),
         0x141 => "sepc".into(),
         0x142 => "scause".into(),
@@ -2064,6 +2139,7 @@ fn csr_name(address: u16) -> String {
         0x303 => "mideleg".into(),
         0x304 => "mie".into(),
         0x305 => "mtvec".into(),
+        0x306 => "mcounteren".into(),
         0x340 => "mscratch".into(),
         0x341 => "mepc".into(),
         0x342 => "mcause".into(),
@@ -2130,6 +2206,13 @@ fn decode_csr(instruction: u32, debugger: &Debugger) -> Option<CsrInfo> {
         old_value,
         new_value,
     })
+}
+
+fn decode_sfence_vma(instruction: u32) -> Option<(usize, usize)> {
+    (instruction & 0xfe00_7fff == 0x1200_0073).then_some((
+        ((instruction >> 15) & 0x1f) as usize,
+        ((instruction >> 20) & 0x1f) as usize,
+    ))
 }
 
 fn decode_alu(instruction: u32, debugger: &Debugger) -> Option<AluInfo> {
@@ -2359,17 +2442,39 @@ mod tests {
             PLIC_MACHINE_THRESHOLD_REGISTER_INDEX,
             2,
         );
+        record_and_set(&mut debugger, &mut app, MSTATUS_REGISTER_INDEX, 1 << 18);
+        record_and_set(&mut debugger, &mut app, MCOUNTEREN_REGISTER_INDEX, 7);
+        record_and_set(&mut debugger, &mut app, SCOUNTEREN_REGISTER_INDEX, 3);
 
         assert_eq!(debugger.machine.bus.uart_interrupt_enable(), 1);
         assert_eq!(debugger.machine.bus.plic_uart_priority(), 1);
         assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
         assert_eq!(debugger.machine.bus.plic_machine_threshold(), 2);
+        assert_eq!(debugger.machine.cpu.csr(0x300), 1 << 18);
+        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
+        assert_eq!(debugger.machine.cpu.csr(0x106), 3);
         assert_eq!(
             register_label(PLIC_MACHINE_CLAIM_REGISTER_INDEX),
             "plic_mclaim"
         );
         undo_last_edit(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.csr(0x106), 0);
+        undo_last_edit(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.csr(0x306), 0);
+        undo_last_edit(&mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.csr(0x300), 0);
+        undo_last_edit(&mut debugger, &mut app);
         assert_eq!(debugger.machine.bus.plic_machine_threshold(), 0);
+    }
+
+    #[test]
+    fn set_command_updates_and_undoes_privileged_csr() {
+        let mut debugger = debugger();
+        let mut app = App::new();
+        execute_command("set mcounteren 7", &mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
+        execute_command("undo", &mut debugger, &mut app);
+        assert_eq!(debugger.machine.cpu.csr(0x306), 0);
     }
 
     #[test]
@@ -2474,6 +2579,12 @@ mod tests {
         assert_eq!(mret.mnemonic, "mret");
         assert_eq!(mret.target_label, "mepc");
         assert_eq!(mret.target, Machine::LOAD_ADDRESS + 0x80);
+
+        let firmware = INSTRUCTION_EBREAK.to_le_bytes();
+        let boot_debugger = Debugger::from_boot(&firmware, &[], &[], 4 * 1024 * 1024).unwrap();
+        let ebreak = decode_trap_flow(INSTRUCTION_EBREAK, &boot_debugger).unwrap();
+        assert_eq!(ebreak.mnemonic, "ebreak");
+        assert_eq!(ebreak.target_label, "mtvec");
 
         assert_eq!(
             code_flow(0x3020_0073, Machine::LOAD_ADDRESS + 8, &debugger),
@@ -2706,6 +2817,8 @@ mod tests {
     #[test]
     fn csr_name_prefers_known_machine_names() {
         assert_eq!(csr_name(0x340), "mscratch");
+        assert_eq!(csr_name(0x306), "mcounteren");
+        assert_eq!(csr_name(0x106), "scounteren");
         assert_eq!(csr_name(0x777), "0x777");
     }
 
@@ -2803,6 +2916,8 @@ mod tests {
     fn trap_return_instruction_is_named_in_code_view() {
         assert_eq!(instruction_name(0x3020_0073), "mret");
         assert_eq!(instruction_name(0x0000_0073), "ecall");
+        assert_eq!(instruction_name(0x1241_8073), "sfence.vma");
+        assert_eq!(decode_sfence_vma(0x1241_8073), Some((3, 4)));
     }
 
     #[test]

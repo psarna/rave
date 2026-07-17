@@ -36,7 +36,7 @@ __attribute__((noreturn)) void _start(void) {
     }
 
     WRITE_CSR(mstatus, ~0UL);
-    if (READ_CSR(mstatus) != ((1UL << 1) | (1UL << 3) | (1UL << 5) | (1UL << 7) | (1UL << 8) | (3UL << 11))) {
+    if (READ_CSR(mstatus) != ((1UL << 1) | (1UL << 3) | (1UL << 5) | (1UL << 7) | (1UL << 8) | (3UL << 11) | (1UL << 17) | (1UL << 18) | (1UL << 19))) {
         code |= 2;
     }
 

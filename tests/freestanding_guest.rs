@@ -66,6 +66,61 @@ fn compiles_and_runs_an_sv39_guest() {
 }
 
 #[test]
+fn compiles_and_runs_a_privileged_memory_guest() {
+    let result = compile_and_run_guest_with_march("privileged", "rv64im_zicsr", b"", 100_000);
+    assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });
+    assert_eq!(result.uart_output, b"P");
+}
+
+#[test]
+fn precompiled_privileged_demo_is_runnable() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let image = std::fs::read(root.join("demo/privileged.bin")).unwrap();
+    let mut machine =
+        Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
+    assert_eq!(
+        machine.run(100_000).unwrap(),
+        HaltReason::Breakpoint { code: 0 }
+    );
+    assert_eq!(machine.bus.uart_output(), b"P");
+}
+
+#[test]
+fn precompiled_boot_payload_reaches_its_wait_loop() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let image = std::fs::read(root.join("demo/boot_payload.bin")).unwrap();
+    let mut machine = Machine::from_raw(&image, Machine::KERNEL_ADDRESS, 4 * 1024 * 1024).unwrap();
+    for _ in 0..100 {
+        assert_eq!(machine.step().unwrap(), None);
+        if machine.bus.uart_output() == b"B\n" {
+            break;
+        }
+    }
+    assert_eq!(machine.bus.uart_output(), b"B\n");
+}
+
+#[test]
+fn precompiled_boot_demo_hands_off_to_supervisor_mode() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let firmware = std::fs::read(root.join("demo/boot_shim.bin")).unwrap();
+    let kernel = std::fs::read(root.join("demo/boot_payload.bin")).unwrap();
+    let device_tree = std::fs::read(root.join("demo/rave.dtb")).unwrap();
+    let mut machine =
+        Machine::from_boot(&firmware, &kernel, &device_tree, 128 * 1024 * 1024).unwrap();
+    for _ in 0..100 {
+        assert_eq!(machine.step().unwrap(), None);
+        if machine.bus.uart_output() == b"B\n" {
+            break;
+        }
+    }
+    assert_eq!(
+        machine.cpu.privilege_mode(),
+        rave::PrivilegeMode::Supervisor
+    );
+    assert_eq!(machine.bus.uart_output(), b"B\n");
+}
+
+#[test]
 fn compiles_and_runs_a_machine_trap_guest() {
     let result = compile_and_run_guest_with_march("mtrap", "rv64im_zicsr", b"", 100_000);
     assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });

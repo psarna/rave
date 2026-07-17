@@ -113,6 +113,8 @@ const INSTRUCTION_EBREAK: u32 = 0x0010_0073;
 const INSTRUCTION_MRET: u32 = 0x3020_0073;
 const INSTRUCTION_SRET: u32 = 0x1020_0073;
 const INSTRUCTION_WFI: u32 = 0x1050_0073;
+const INSTRUCTION_SFENCE_VMA: u32 = 0x1200_0073;
+const INSTRUCTION_SFENCE_VMA_MASK: u32 = 0xfe00_7fff;
 const INSTRUCTION_NOP: u32 = 0x0000_0013; // addi x0, x0, 0
 const INSTRUCTION_FENCE_I: u32 = 0x0000_100f;
 const UPPER_IMMEDIATE_MASK: u32 = 0xffff_f000;
@@ -128,6 +130,7 @@ const CSR_MEDELEG: u16 = 0x302;
 const CSR_MIDELEG: u16 = 0x303;
 const CSR_MIE: u16 = 0x304;
 const CSR_MTVEC: u16 = 0x305;
+const CSR_MCOUNTEREN: u16 = 0x306;
 const CSR_MSCRATCH: u16 = 0x340;
 const CSR_MEPC: u16 = 0x341;
 const CSR_MCAUSE: u16 = 0x342;
@@ -136,6 +139,7 @@ const CSR_MIP: u16 = 0x344;
 const CSR_SSTATUS: u16 = 0x100;
 const CSR_SIE: u16 = 0x104;
 const CSR_STVEC: u16 = 0x105;
+const CSR_SCOUNTEREN: u16 = 0x106;
 const CSR_SSCRATCH: u16 = 0x140;
 const CSR_SEPC: u16 = 0x141;
 const CSR_SCAUSE: u16 = 0x142;
@@ -157,9 +161,13 @@ const MSTATUS_MPP_USER: u64 = 0b00 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_SUPERVISOR: u64 = 0b01 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_RESERVED: u64 = 0b10 << MSTATUS_MPP_SHIFT;
 const MSTATUS_MPP_MACHINE: u64 = 0b11 << MSTATUS_MPP_SHIFT;
-const SSTATUS_WRITABLE_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+const MSTATUS_MPRV: u64 = 1 << 17;
+const MSTATUS_SUM: u64 = 1 << 18;
+const MSTATUS_MXR: u64 = 1 << 19;
+const SSTATUS_WRITABLE_MASK: u64 =
+    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR;
 const MSTATUS_WRITABLE_MASK: u64 =
-    SSTATUS_WRITABLE_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+    SSTATUS_WRITABLE_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK | MSTATUS_MPRV;
 const MIP_SSIP: u64 = 1 << 1;
 const MIP_MSIP: u64 = 1 << 3;
 const MIP_STIP: u64 = 1 << 5;
@@ -177,10 +185,16 @@ const MTVAL_WRITABLE_MASK: u64 = u64::MAX;
 const MSCRATCH_WRITABLE_MASK: u64 = u64::MAX;
 const MEDELEG_WRITABLE_MASK: u64 = u64::MAX;
 const MIDELEG_WRITABLE_MASK: u64 = S_INTERRUPT_MASK;
-const MISA_VALUE: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 18);
+const MISA_VALUE: u64 =
+    (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
+const COUNTEREN_CYCLE: u64 = 1 << 0;
+const COUNTEREN_TIME: u64 = 1 << 1;
+const COUNTEREN_INSTRET: u64 = 1 << 2;
+const COUNTEREN_WRITABLE_MASK: u64 = COUNTEREN_CYCLE | COUNTEREN_TIME | COUNTEREN_INSTRET;
 
 const TRAP_INSTRUCTION_ACCESS_FAULT: u64 = 1;
 const TRAP_ILLEGAL_INSTRUCTION: u64 = 2;
+const TRAP_BREAKPOINT: u64 = 3;
 const TRAP_LOAD_ADDRESS_MISALIGNED: u64 = 4;
 const TRAP_STORE_ADDRESS_MISALIGNED: u64 = 6;
 const TRAP_LOAD_ACCESS_FAULT: u64 = 5;
@@ -256,6 +270,7 @@ pub enum StepError {
     LoadPageFault { pc: u64, address: u64 },
     StorePageFault { pc: u64, address: u64 },
     IllegalInstruction { pc: u64, instruction: u32 },
+    Breakpoint { pc: u64 },
     EnvironmentCall { pc: u64 },
 }
 
@@ -313,6 +328,7 @@ impl fmt::Display for StepError {
             Self::IllegalInstruction { pc, instruction } => {
                 write!(f, "illegal instruction {instruction:#010x} at {pc:#018x}")
             }
+            Self::Breakpoint { pc } => write!(f, "breakpoint at {pc:#018x}"),
             Self::EnvironmentCall { pc } => write!(f, "ecall at {pc:#018x}"),
         }
     }
@@ -332,6 +348,7 @@ pub struct Cpu {
     csrs: CsrFile,
     reservation: Option<u64>,
     privilege_mode: PrivilegeMode,
+    host_ebreak_exit: bool,
     pub pc: u64,
 }
 
@@ -342,12 +359,14 @@ struct CsrFile {
     mideleg: u64,
     mie: u64,
     mtvec: u64,
+    mcounteren: u64,
     mscratch: u64,
     mepc: u64,
     mcause: u64,
     mtval: u64,
     mip: u64,
     stvec: u64,
+    scounteren: u64,
     sscratch: u64,
     sepc: u64,
     scause: u64,
@@ -417,6 +436,7 @@ impl Cpu {
             csrs: CsrFile::default(),
             reservation: None,
             privilege_mode: PrivilegeMode::Machine,
+            host_ebreak_exit: true,
             pc,
         }
     }
@@ -435,8 +455,21 @@ impl Cpu {
         self.csrs.read(address).unwrap_or(0)
     }
 
+    /// Writes a CSR through its normal WARL legalization for debugger edits.
+    pub fn set_csr_for_debug(&mut self, address: u16, value: u64) -> bool {
+        self.csrs.write(address, value).is_some()
+    }
+
     pub fn privilege_mode(&self) -> PrivilegeMode {
         self.privilege_mode
+    }
+
+    pub fn set_host_ebreak_exit(&mut self, enabled: bool) {
+        self.host_ebreak_exit = enabled;
+    }
+
+    pub fn host_ebreak_exit_enabled(&self) -> bool {
+        self.host_ebreak_exit
     }
 
     pub fn reservation_matches(&self, address: u64) -> bool {
@@ -535,6 +568,10 @@ impl Cpu {
             }
             StepError::IllegalInstruction { pc, instruction } => {
                 self.enter_trap(TRAP_ILLEGAL_INSTRUCTION, pc, u64::from(instruction), false);
+                Ok(None)
+            }
+            StepError::Breakpoint { pc } => {
+                self.enter_trap(TRAP_BREAKPOINT, pc, 0, false);
                 Ok(None)
             }
             StepError::EnvironmentCall { pc } => {
@@ -914,9 +951,12 @@ impl Cpu {
         next_pc: u64,
     ) -> Result<Execution, StepError> {
         match instruction.raw {
-            INSTRUCTION_EBREAK => Ok(Execution::Halt(HaltReason::Breakpoint {
-                code: self.registers[RETURN_VALUE_REGISTER],
-            })),
+            INSTRUCTION_EBREAK if self.host_ebreak_exit => {
+                Ok(Execution::Halt(HaltReason::Breakpoint {
+                    code: self.registers[RETURN_VALUE_REGISTER],
+                }))
+            }
+            INSTRUCTION_EBREAK => Err(StepError::Breakpoint { pc }),
             INSTRUCTION_ECALL => Err(StepError::EnvironmentCall { pc }),
             INSTRUCTION_MRET if self.privilege_mode == PrivilegeMode::Machine => {
                 Ok(self.execute_mret())
@@ -927,6 +967,13 @@ impl Cpu {
             // The spec allows implementing wfi as a no-op; interrupts are
             // checked at the top of every step anyway.
             INSTRUCTION_WFI if self.privilege_mode != PrivilegeMode::User => {
+                Ok(Execution::Continue { next_pc })
+            }
+            _ if instruction.raw & INSTRUCTION_SFENCE_VMA_MASK == INSTRUCTION_SFENCE_VMA
+                && self.privilege_mode != PrivilegeMode::User =>
+            {
+                // There is no translation cache, so every page-table change is
+                // already visible to the next access.
                 Ok(Execution::Continue { next_pc })
             }
             _ if instruction.funct3 == FUNCT_SYSTEM_PRIVILEGED => Err(illegal(pc, instruction.raw)),
@@ -945,6 +992,9 @@ impl Cpu {
         }
         self.csrs.mstatus |= MSTATUS_MPIE;
         self.csrs.mstatus &= !MSTATUS_MPP_MASK;
+        if next_mode != PrivilegeMode::Machine {
+            self.csrs.mstatus &= !MSTATUS_MPRV;
+        }
         self.privilege_mode = next_mode;
         Execution::Continue { next_pc }
     }
@@ -1097,6 +1147,18 @@ impl Cpu {
         let address = csr_address(instruction.raw);
         if !csr_accessible(address, self.privilege_mode) {
             return Err(illegal(pc, instruction.raw));
+        }
+        if let Some(counter) = counter_enable_bit(address) {
+            let machine_enabled = self.csrs.mcounteren & counter != 0;
+            let supervisor_enabled = self.csrs.scounteren & counter != 0;
+            let enabled = match self.privilege_mode {
+                PrivilegeMode::Machine => true,
+                PrivilegeMode::Supervisor => machine_enabled,
+                PrivilegeMode::User => machine_enabled && supervisor_enabled,
+            };
+            if !enabled {
+                return Err(illegal(pc, instruction.raw));
+            }
         }
         let old_value = self
             .csrs
@@ -1267,7 +1329,8 @@ impl Cpu {
         access: MemoryAccess,
     ) -> Result<AddressTranslation, StepError> {
         let mode = self.csrs.satp >> SATP_MODE_SHIFT;
-        if self.privilege_mode == PrivilegeMode::Machine || mode == SATP_MODE_BARE {
+        let effective_mode = self.effective_privilege_mode(access);
+        if effective_mode == PrivilegeMode::Machine || mode == SATP_MODE_BARE {
             return Ok(AddressTranslation {
                 physical_address: address,
                 paging_active: false,
@@ -1296,7 +1359,7 @@ impl Cpu {
                 table = ((pte >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << PAGE_SHIFT;
                 continue;
             }
-            if !pte_allows_access(pte, self.privilege_mode, access)
+            if !pte_allows_access(pte, effective_mode, access, self.csrs.mstatus)
                 || !superpage_aligned(pte, level)
             {
                 return Err(page_fault(self.pc, address, access));
@@ -1317,6 +1380,17 @@ impl Cpu {
         Err(page_fault(self.pc, address, access))
     }
 
+    fn effective_privilege_mode(&self, access: MemoryAccess) -> PrivilegeMode {
+        if self.privilege_mode == PrivilegeMode::Machine
+            && !matches!(access, MemoryAccess::Fetch)
+            && self.csrs.mstatus & MSTATUS_MPRV != 0
+        {
+            privilege_mode_from_mpp(self.csrs.mstatus)
+        } else {
+            self.privilege_mode
+        }
+    }
+
     fn clear_reservation_for_store(&mut self, address: u64) {
         if self.reservation == Some(address) {
             self.reservation = None;
@@ -1326,6 +1400,15 @@ impl Cpu {
 
 fn csr_accessible(address: u16, mode: PrivilegeMode) -> bool {
     privilege_mode_rank(mode) >= u8::try_from((address >> 8) & 0b11).unwrap()
+}
+
+fn counter_enable_bit(address: u16) -> Option<u64> {
+    match address {
+        CSR_CYCLE => Some(COUNTEREN_CYCLE),
+        CSR_TIME => Some(COUNTEREN_TIME),
+        CSR_INSTRET => Some(COUNTEREN_INSTRET),
+        _ => None,
+    }
 }
 
 fn privilege_mode_rank(mode: PrivilegeMode) -> u8 {
@@ -1421,16 +1504,19 @@ fn pte_ppn(pte: u64, index: usize) -> u64 {
     (pte >> (PTE_PPN_SHIFT + index as u64 * 9)) & VPN_MASK
 }
 
-fn pte_allows_access(pte: u64, mode: PrivilegeMode, access: MemoryAccess) -> bool {
+fn pte_allows_access(pte: u64, mode: PrivilegeMode, access: MemoryAccess, mstatus: u64) -> bool {
     if mode == PrivilegeMode::User && pte & PTE_U == 0 {
         return false;
     }
-    if mode == PrivilegeMode::Supervisor && pte & PTE_U != 0 {
+    if mode == PrivilegeMode::Supervisor
+        && pte & PTE_U != 0
+        && (matches!(access, MemoryAccess::Fetch) || mstatus & MSTATUS_SUM == 0)
+    {
         return false;
     }
     match access {
         MemoryAccess::Fetch => pte & PTE_X != 0,
-        MemoryAccess::Load => pte & PTE_R != 0,
+        MemoryAccess::Load => pte & PTE_R != 0 || (mstatus & MSTATUS_MXR != 0 && pte & PTE_X != 0),
         MemoryAccess::Store => pte & (PTE_R | PTE_W) == PTE_R | PTE_W,
     }
 }
@@ -1879,6 +1965,7 @@ impl CsrFile {
             CSR_MIDELEG => Some(self.mideleg),
             CSR_MIE => Some(self.mie),
             CSR_MTVEC => Some(self.mtvec),
+            CSR_MCOUNTEREN => Some(self.mcounteren),
             CSR_MSCRATCH => Some(self.mscratch),
             CSR_MEPC => Some(self.mepc),
             CSR_MCAUSE => Some(self.mcause),
@@ -1887,6 +1974,7 @@ impl CsrFile {
             CSR_SSTATUS => Some(self.mstatus & SSTATUS_WRITABLE_MASK),
             CSR_SIE => Some(self.mie & S_INTERRUPT_MASK),
             CSR_STVEC => Some(self.stvec),
+            CSR_SCOUNTEREN => Some(self.scounteren),
             CSR_SSCRATCH => Some(self.sscratch),
             CSR_SEPC => Some(self.sepc),
             CSR_SCAUSE => Some(self.scause),
@@ -1907,6 +1995,7 @@ impl CsrFile {
             CSR_MIDELEG => self.mideleg = value & MIDELEG_WRITABLE_MASK,
             CSR_MIE => self.mie = value & MIE_WRITABLE_MASK,
             CSR_MTVEC => self.mtvec = value & MTVEC_WRITABLE_MASK,
+            CSR_MCOUNTEREN => self.mcounteren = value & COUNTEREN_WRITABLE_MASK,
             CSR_MSCRATCH => self.mscratch = value & MSCRATCH_WRITABLE_MASK,
             CSR_MEPC => self.mepc = value & MEPC_WRITABLE_MASK,
             CSR_MCAUSE => self.mcause = value & MCAUSE_WRITABLE_MASK,
@@ -1918,6 +2007,7 @@ impl CsrFile {
             }
             CSR_SIE => self.mie = (self.mie & !S_INTERRUPT_MASK) | (value & S_INTERRUPT_MASK),
             CSR_STVEC => self.stvec = value & MTVEC_WRITABLE_MASK,
+            CSR_SCOUNTEREN => self.scounteren = value & COUNTEREN_WRITABLE_MASK,
             CSR_SSCRATCH => self.sscratch = value & MSCRATCH_WRITABLE_MASK,
             CSR_SEPC => self.sepc = value & MEPC_WRITABLE_MASK,
             CSR_SCAUSE => self.scause = value & MCAUSE_WRITABLE_MASK,
@@ -2484,6 +2574,61 @@ mod tests {
     }
 
     #[test]
+    fn sv39_honors_sum_and_mxr_for_supervisor_loads() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(0x8000);
+        let root = DRAM_START + 0x1000;
+        let level1 = DRAM_START + 0x2000;
+        let level0 = DRAM_START + 0x3000;
+        let data = DRAM_START + 0x4000;
+        install_sv39_table(&mut bus, root, level1, level0);
+        install_pte(&mut bus, level0, 1, data, PTE_V | PTE_U | PTE_X);
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
+
+        assert!(cpu
+            .translate_address_inner(&bus, 0x1000, MemoryAccess::Load)
+            .is_err());
+        cpu.csrs.mstatus = MSTATUS_SUM | MSTATUS_MXR;
+        assert_eq!(
+            cpu.translate_address_inner(&bus, 0x1000, MemoryAccess::Load)
+                .unwrap()
+                .physical_address,
+            data
+        );
+        assert!(cpu
+            .translate_address_inner(&bus, 0x1000, MemoryAccess::Fetch)
+            .is_err());
+    }
+
+    #[test]
+    fn mprv_uses_mpp_for_machine_data_accesses_only() {
+        let mut cpu = Cpu::new(0x1000);
+        let mut bus = Bus::new(0x8000);
+        let root = DRAM_START + 0x1000;
+        let level1 = DRAM_START + 0x2000;
+        let level0 = DRAM_START + 0x3000;
+        let data = DRAM_START + 0x4000;
+        install_sv39_table(&mut bus, root, level1, level0);
+        install_pte(&mut bus, level0, 1, data, PTE_V | PTE_R);
+        cpu.csrs.satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (root >> PAGE_SHIFT);
+        cpu.csrs.mstatus = MSTATUS_MPRV | MSTATUS_MPP_SUPERVISOR;
+
+        assert_eq!(
+            cpu.translate_address_inner(&bus, 0x1000, MemoryAccess::Load)
+                .unwrap()
+                .physical_address,
+            data
+        );
+        assert_eq!(
+            cpu.translate_address_inner(&bus, 0x1000, MemoryAccess::Fetch)
+                .unwrap()
+                .physical_address,
+            0x1000
+        );
+    }
+
+    #[test]
     fn rv64a_lr_requires_zero_rs2() {
         let mut cpu = Cpu::new(DRAM_START);
         let mut bus = Bus::new(16);
@@ -2887,6 +3032,28 @@ mod tests {
     }
 
     #[test]
+    fn sfence_vma_is_a_validated_noop_without_a_tlb() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        let sfence_with_operands = INSTRUCTION_SFENCE_VMA | (3 << RS1_SHIFT) | (4 << RS2_SHIFT);
+        bus.write_u32(DRAM_START, sfence_with_operands).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.pc, DRAM_START + INSTRUCTION_SIZE);
+        assert_eq!(cpu.csr(CSR_INSTRET), 1);
+    }
+
+    #[test]
+    fn sfence_vma_in_user_mode_is_illegal() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        cpu.privilege_mode = PrivilegeMode::User;
+        bus.write_u32(DRAM_START, INSTRUCTION_SFENCE_VMA).unwrap();
+
+        assert_illegal_instruction_trap(&mut cpu, &mut bus, INSTRUCTION_SFENCE_VMA);
+    }
+
+    #[test]
     fn compressed_hint_encodings_expand_to_nop() {
         // c.slli x0, 1
         assert_eq!(decode_compressed_instruction(0x0006), Some(INSTRUCTION_NOP));
@@ -2947,6 +3114,23 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MSTATUS) & MSTATUS_MIE, 0);
         assert_ne!(cpu.csr(CSR_MSTATUS) & MSTATUS_MPIE, 0);
         assert_eq!(cpu.csr(CSR_MSTATUS) & MSTATUS_MPP_MASK, MSTATUS_MPP_MACHINE);
+        assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    #[test]
+    fn ebreak_can_enter_architectural_breakpoint_trap() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        let vector = DRAM_START + 64;
+        cpu.set_host_ebreak_exit(false);
+        cpu.csrs.mtvec = vector;
+        bus.write_u32(DRAM_START, INSTRUCTION_EBREAK).unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.pc, vector);
+        assert_eq!(cpu.csr(CSR_MEPC), DRAM_START);
+        assert_eq!(cpu.csr(CSR_MCAUSE), TRAP_BREAKPOINT);
+        assert_eq!(cpu.csr(CSR_MTVAL), 0);
         assert_eq!(cpu.csr(CSR_INSTRET), 0);
     }
 
@@ -3111,6 +3295,36 @@ mod tests {
         assert_eq!(cpu.register(6), 2);
         assert_eq!(cpu.csr(CSR_CYCLE), 3);
         assert_eq!(cpu.csr(CSR_TIME), 3);
+    }
+
+    #[test]
+    fn counter_enable_csrs_gate_lower_privilege_counter_access() {
+        let instruction = encode_csr(u32::from(CSR_TIME), FUNCT_CSRRS, 0, 5);
+
+        let mut supervisor = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        supervisor.privilege_mode = PrivilegeMode::Supervisor;
+        supervisor.csrs.mtvec = DRAM_START + 4;
+        bus.write_u32(DRAM_START, instruction).unwrap();
+        assert_illegal_instruction_trap(&mut supervisor, &mut bus, instruction);
+
+        let mut user = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(8);
+        user.privilege_mode = PrivilegeMode::User;
+        user.csrs.mcounteren = COUNTEREN_TIME;
+        user.csrs.scounteren = COUNTEREN_TIME;
+        bus.write_u32(DRAM_START, instruction).unwrap();
+        assert_eq!(user.step(&mut bus), Ok(None));
+        assert_eq!(user.register(5), 0);
+    }
+
+    #[test]
+    fn counter_enable_csrs_apply_warl_masks() {
+        let mut csrs = CsrFile::default();
+        csrs.write(CSR_MCOUNTEREN, u64::MAX).unwrap();
+        csrs.write(CSR_SCOUNTEREN, u64::MAX).unwrap();
+        assert_eq!(csrs.read(CSR_MCOUNTEREN), Some(COUNTEREN_WRITABLE_MASK));
+        assert_eq!(csrs.read(CSR_SCOUNTEREN), Some(COUNTEREN_WRITABLE_MASK));
     }
 
     #[test]

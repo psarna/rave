@@ -83,7 +83,7 @@ struct Clint {
 
 #[derive(Default)]
 struct Plic {
-    uart_priority: u32,
+    priorities: [u32; Plic::SOURCE_COUNT + 1],
     enables: [u32; Plic::CONTEXT_COUNT],
     thresholds: [u32; Plic::CONTEXT_COUNT],
     uart_claimed: bool,
@@ -94,6 +94,8 @@ struct Uart {
     output: Vec<u8>,
     input: VecDeque<u8>,
     interrupt_enable: u8,
+    line_control: u8,
+    divisor_latch: u16,
     waiting_for_input: bool,
 }
 
@@ -190,11 +192,11 @@ impl Bus {
     }
 
     pub fn plic_uart_priority(&self) -> u64 {
-        u64::from(self.plic.uart_priority)
+        u64::from(self.plic.priorities[Plic::UART_SOURCE as usize])
     }
 
     pub fn set_plic_uart_priority(&mut self, value: u64) {
-        self.plic.uart_priority = (value as u32) & 0x7;
+        self.plic.priorities[Plic::UART_SOURCE as usize] = (value as u32) & 0x7;
     }
 
     pub fn plic_pending(&self) -> u64 {
@@ -532,6 +534,7 @@ impl Clint {
 }
 
 impl Plic {
+    const SOURCE_COUNT: usize = 10;
     const UART_SOURCE: u32 = 10;
     const UART_SOURCE_BIT: u32 = 1 << Self::UART_SOURCE;
     const CONTEXT_COUNT: usize = 2;
@@ -564,15 +567,10 @@ impl Plic {
     }
 
     fn peek(&self, offset: u64, size: usize, uart: &Uart) -> Result<u64, BusError> {
-        if register_contains(
-            offset,
-            size,
-            Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE,
-            Self::REGISTER_SIZE,
-        ) {
+        if let Some(source) = priority_source(offset, size) {
             return Ok(read_le_field(
-                u64::from(self.uart_priority),
-                offset - (Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE),
+                u64::from(self.priorities[source]),
+                offset - (Self::PRIORITY_BASE + source as u64 * Self::REGISTER_SIZE),
                 size,
             ));
         }
@@ -612,19 +610,16 @@ impl Plic {
     }
 
     fn write(&mut self, offset: u64, size: usize, value: u64) -> Result<(), BusError> {
-        if register_contains(
-            offset,
-            size,
-            Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE,
-            Self::REGISTER_SIZE,
-        ) {
+        if let Some(source) = priority_source(offset, size) {
             let next = write_le_field(
-                u64::from(self.uart_priority),
-                offset - (Self::PRIORITY_BASE + u64::from(Self::UART_SOURCE) * Self::REGISTER_SIZE),
+                u64::from(self.priorities[source]),
+                offset - (Self::PRIORITY_BASE + source as u64 * Self::REGISTER_SIZE),
                 size,
                 value,
             );
-            self.uart_priority = (next as u32) & 0x7;
+            if source != 0 {
+                self.priorities[source] = (next as u32) & 0x7;
+            }
             return Ok(());
         }
         if let Some(context) = context_enable(offset, size) {
@@ -689,7 +684,10 @@ impl Plic {
     }
 
     fn pending_source(&self, uart: &Uart) -> Option<u32> {
-        if !self.uart_claimed && self.uart_priority > 0 && uart.receive_interrupt_pending() {
+        if !self.uart_claimed
+            && self.priorities[Self::UART_SOURCE as usize] > 0
+            && uart.receive_interrupt_pending()
+        {
             Some(Self::UART_SOURCE)
         } else {
             None
@@ -697,15 +695,29 @@ impl Plic {
     }
 
     fn source_enabled(&self, context: usize, source: u32) -> bool {
-        self.enables[context] & (1 << source) != 0 && self.uart_priority > self.thresholds[context]
+        self.enables[context] & (1 << source) != 0
+            && self.priorities[source as usize] > self.thresholds[context]
     }
+}
+
+fn priority_source(offset: u64, size: usize) -> Option<usize> {
+    (0..=Plic::SOURCE_COUNT).find(|source| {
+        register_contains(
+            offset,
+            size,
+            Plic::PRIORITY_BASE + *source as u64 * Plic::REGISTER_SIZE,
+            Plic::REGISTER_SIZE,
+        )
+    })
 }
 
 impl Uart {
     const RECEIVER_BUFFER_OR_TRANSMIT_HOLDING: u64 = 0;
     const INTERRUPT_ENABLE: u64 = 1;
     const INTERRUPT_IDENTIFICATION: u64 = 2;
+    const LINE_CONTROL: u64 = 3;
     const LINE_STATUS: u64 = 5;
+    const LINE_CONTROL_DIVISOR_LATCH_ACCESS: u8 = 1 << 7;
     const INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE: u8 = 1;
     const INTERRUPT_IDENTIFICATION_NO_INTERRUPT: u8 = 1;
     const INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE: u8 = 0x04;
@@ -715,13 +727,20 @@ impl Uart {
 
     fn read(&mut self, offset: u64) -> u8 {
         match offset {
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING if self.divisor_latch_access() => {
+                self.divisor_latch as u8
+            }
             Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => {
                 let value = self.input.pop_front();
                 self.waiting_for_input = value.is_none();
                 value.unwrap_or(0)
             }
+            Self::INTERRUPT_ENABLE if self.divisor_latch_access() => {
+                (self.divisor_latch >> 8) as u8
+            }
             Self::INTERRUPT_ENABLE => self.interrupt_enable,
             Self::INTERRUPT_IDENTIFICATION => self.interrupt_identification(),
+            Self::LINE_CONTROL => self.line_control,
             Self::LINE_STATUS => {
                 let has_input = !self.input.is_empty();
                 self.waiting_for_input = !has_input;
@@ -733,9 +752,16 @@ impl Uart {
 
     fn peek(&self, offset: u64) -> u8 {
         match offset {
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING if self.divisor_latch_access() => {
+                self.divisor_latch as u8
+            }
             Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => self.input.front().copied().unwrap_or(0),
+            Self::INTERRUPT_ENABLE if self.divisor_latch_access() => {
+                (self.divisor_latch >> 8) as u8
+            }
             Self::INTERRUPT_ENABLE => self.interrupt_enable,
             Self::INTERRUPT_IDENTIFICATION => self.interrupt_identification(),
+            Self::LINE_CONTROL => self.line_control,
             Self::LINE_STATUS => Self::line_status(!self.input.is_empty()),
             _ => 0,
         }
@@ -765,12 +791,23 @@ impl Uart {
 
     fn write(&mut self, offset: u64, value: u8) {
         match offset {
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING if self.divisor_latch_access() => {
+                self.divisor_latch = (self.divisor_latch & 0xff00) | u16::from(value);
+            }
             Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => self.output.push(value),
+            Self::INTERRUPT_ENABLE if self.divisor_latch_access() => {
+                self.divisor_latch = (self.divisor_latch & 0x00ff) | (u16::from(value) << 8);
+            }
             Self::INTERRUPT_ENABLE => {
                 self.interrupt_enable = value & Self::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE;
             }
+            Self::LINE_CONTROL => self.line_control = value,
             _ => {}
         }
+    }
+
+    fn divisor_latch_access(&self) -> bool {
+        self.line_control & Self::LINE_CONTROL_DIVISOR_LATCH_ACCESS != 0
     }
 }
 
@@ -934,6 +971,18 @@ mod tests {
     }
 
     #[test]
+    fn plic_exposes_all_advertised_priority_registers() {
+        let mut bus = Bus::new(16);
+        for source in 1..=Plic::SOURCE_COUNT {
+            let address = PLIC_START + source as u64 * Plic::REGISTER_SIZE;
+            bus.write_u32(address, source as u32).unwrap();
+            assert_eq!(bus.read_u32(address), Ok((source as u32) & 0x7));
+        }
+        bus.write_u32(PLIC_START, 7).unwrap();
+        assert_eq!(bus.read_u32(PLIC_START), Ok(0));
+    }
+
+    #[test]
     fn uart_interrupt_identification_tracks_receive_interrupt_enable() {
         let mut bus = Bus::new(16);
         bus.push_uart_input(b"C");
@@ -951,6 +1000,21 @@ mod tests {
         bus.write_u8(UART_START, b'O').unwrap();
         bus.write_u8(UART_START, b'K').unwrap();
         assert_eq!(bus.uart_output(), b"OK");
+    }
+
+    #[test]
+    fn uart_divisor_latch_does_not_emit_output() {
+        let mut bus = Bus::new(16);
+        bus.write_u8(UART_START + 3, 0x80).unwrap();
+        bus.write_u8(UART_START, 2).unwrap();
+        bus.write_u8(UART_START + 1, 1).unwrap();
+        assert_eq!(bus.read_u8(UART_START), Ok(2));
+        assert_eq!(bus.read_u8(UART_START + 1), Ok(1));
+        assert!(bus.uart_output().is_empty());
+
+        bus.write_u8(UART_START + 3, 3).unwrap();
+        bus.write_u8(UART_START, b'X').unwrap();
+        assert_eq!(bus.uart_output(), b"X");
     }
 
     #[test]

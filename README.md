@@ -17,7 +17,8 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 - RV64 word operations with 32-bit sign extension
 - mixed 16-bit and 32-bit instruction fetch
 - raw binaries loaded into DRAM at `0x8000_0000`
-- `ebreak` as a temporary host exit boundary; register `a0` is the result code
+- `ebreak` as a temporary host exit boundary in raw-image mode; register `a0`
+  is the result code (firmware boot mode delivers architectural breakpoint traps)
 - 16550-style UART input and output at `0x1000_0000`, including receive interrupts
 - CLINT `msip`, `mtimecmp`, and `mtime` registers with machine software/timer interrupts
 - PLIC UART external interrupt source 10 with machine and supervisor contexts
@@ -30,6 +31,35 @@ cargo run -- path/to/guest.bin
 
 When stdin is piped in non-interactive mode, the bytes are queued as UART
 receive data for the guest.
+
+## Firmware and OS boot
+
+The `boot` command loads OpenSBI at `0x8000_0000`, a kernel at
+`0x8020_0000`, and an 8-byte-aligned device tree near the top of guest RAM.
+It starts hart 0 with the standard firmware arguments (`a0 = 0`, `a1 = DTB`)
+and streams UART output while the guest runs:
+
+```sh
+cargo run --release -- boot \
+  --firmware path/to/fw_jump.bin \
+  --kernel path/to/Image \
+  --dtb demo/rave.dtb \
+  --memory 128M
+```
+
+The precompiled `demo/rave.dtb` device tree describes the current single-hart platform, UART,
+CLINT, PLIC, and 128 MiB default memory layout. If `--memory` is changed,
+update the memory node in the device tree to match. A Linux kernel with a
+built-in initramfs can boot without a block device; virtio block storage is
+still future work. Recompile the supplied source after editing it with:
+
+```sh
+dtc -I dts -O dtb -o demo/rave.dtb demo/rave.dts
+```
+
+Add `--interactive` after `boot` to inspect OpenSBI and its payload in the TUI.
+The debugger's `start` command restores all three boot images and the firmware
+register contract.
 
 ## Debugging HQ
 
@@ -99,9 +129,36 @@ After the guest writes `satp` and enters supervisor mode, the TUI code pane
 renders translated fetches as `virtual -> physical`, and load/store/AMO previews
 show effective virtual addresses with their physical targets.
 
+Privileged-memory and fence demo:
+
+```sh
+cargo run -- --interactive demo/privileged.bin
+```
+
+This self-checking guest exercises `MPRV`, `SUM`, `MXR`, `mcounteren`,
+`scounteren`, and `sfence.vma`, then prints `P`. The TUI decodes
+`sfence.vma` operands and exposes `mstatus`, `mcounteren`, and `scounteren` as
+editable pseudo-registers.
+
+OpenSBI handoff payload demo:
+
+```sh
+cargo run -- boot --interactive \
+  --firmware demo/boot_shim.bin \
+  --kernel demo/boot_payload.bin \
+  --dtb demo/rave.dtb
+```
+
+Continue execution to see the minimal M-mode shim enter the demo in supervisor
+mode. The payload prints `B` and waits with `wfi`, leaving the machine available
+for inspection. Substitute an OpenSBI `fw_jump.bin` for `demo/boot_shim.bin` to
+exercise the complete SBI firmware initialization path.
+
 Auto tests:
 ```sh
 cargo test
 ```
 
-Virtio and a real firmware/boot path are intentionally not here yet. Full OS boot still needs more privilege and device work.
+Virtio is not implemented yet. The firmware boot path is present, while full
+Linux compatibility may still expose privileged-architecture gaps that are not
+covered by the small integration guests.
