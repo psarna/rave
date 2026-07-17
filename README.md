@@ -51,7 +51,7 @@ cargo run --release -- boot \
 ```
 
 The precompiled `demo/rave.dtb` device tree describes the current single-hart platform, UART,
-CLINT, PLIC, and 128 MiB default memory layout. Rave rejects a DTB whose single
+CLINT, PLIC, and 128 MiB default memory layout. rave rejects a DTB whose single
 contiguous memory region does not match `--memory`; if that option is changed,
 update the memory node in the device tree to match. A Linux kernel with a
 built-in initramfs can boot without a block device; virtio block storage is
@@ -178,6 +178,24 @@ Auto tests:
 ```sh
 cargo test
 ```
+
+## Browser demo
+
+The emulator core also builds to WebAssembly. The static site in `web/` runs
+the machine in a Web Worker, offers bundled or uploaded firmware/kernel images,
+and connects keyboard input and terminal output to the emulated UART.
+
+Install `wasm-pack`, then build and serve the repository root:
+
+```sh
+./build-web.sh
+python3 -m http.server 8000
+```
+
+Open `http://localhost:8000/web/`. The site must be served over HTTP rather
+than opened with `file://`, because it fetches the WASM and guest images. A
+production deployment should publish `web/`, `demo/`, and the generated
+`web/pkg/` directory together.
 
 Virtio is not implemented yet. The firmware boot path is present, while full
 Linux compatibility may still expose privileged-architecture gaps that are not

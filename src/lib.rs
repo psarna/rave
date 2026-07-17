@@ -3,6 +3,9 @@ mod cpu;
 mod debugger;
 mod machine;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+
 pub use bus::{Bus, BusError, Region};
 pub use cpu::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, AddressTranslation,
