@@ -37,7 +37,8 @@ receive data for the guest.
 The `boot` command loads OpenSBI at `0x8000_0000`, a kernel at
 `0x8020_0000`, and an 8-byte-aligned device tree near the top of guest RAM.
 It starts hart 0 with the standard firmware arguments (`a0 = 0`, `a1 = DTB`)
-and streams UART output while the guest runs:
+and streams UART output while the guest runs. Headless boot runs until the guest
+halts or the process is stopped; use `--limit` to impose an instruction cap:
 
 ```sh
 cargo run --release -- boot \
@@ -48,7 +49,8 @@ cargo run --release -- boot \
 ```
 
 The precompiled `demo/rave.dtb` device tree describes the current single-hart platform, UART,
-CLINT, PLIC, and 128 MiB default memory layout. If `--memory` is changed,
+CLINT, PLIC, and 128 MiB default memory layout. Rave rejects a DTB whose single
+contiguous memory region does not match `--memory`; if that option is changed,
 update the memory node in the device tree to match. A Linux kernel with a
 built-in initramfs can boot without a block device; virtio block storage is
 still future work. Recompile the supplied source after editing it with:

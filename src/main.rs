@@ -14,7 +14,8 @@ const USAGE: &str = "usage:
   rave [--interactive] <guest.bin>
   rave boot [--interactive] --firmware <fw_jump.bin> --kernel <Image> --dtb <rave.dtb> [--memory <size>] [--limit <instructions>]
 
-sizes accept K, M, and G suffixes (default boot memory: 128M)";
+sizes accept K, M, and G suffixes (default boot memory: 128M)
+boot runs until the guest halts by default; --limit is headless-only";
 
 fn main() {
     if let Err(error) = run() {
@@ -62,7 +63,7 @@ fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut kernel = None;
     let mut device_tree = None;
     let mut memory_size = Machine::BOOT_MEMORY_SIZE;
-    let mut instruction_limit = u64::MAX;
+    let mut instruction_limit = None;
     let mut interactive = false;
     let mut index = 0;
     while index < arguments.len() {
@@ -82,9 +83,11 @@ fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--limit" => {
                 let value = option_value(arguments, &mut index, argument)?;
-                instruction_limit = value
-                    .parse()
-                    .map_err(|_| format!("invalid instruction limit: {value}"))?;
+                instruction_limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid instruction limit: {value}"))?,
+                );
             }
             other => return Err(format!("unknown boot option: {other}\n{USAGE}").into()),
         }
@@ -94,11 +97,15 @@ fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let firmware = fs::read(firmware.ok_or("boot requires --firmware")?)?;
     let kernel = fs::read(kernel.ok_or("boot requires --kernel")?)?;
     let device_tree = fs::read(device_tree.ok_or("boot requires --dtb")?)?;
+    validate_dtb_memory(&device_tree, memory_size)?;
     if interactive {
+        if instruction_limit.is_some() {
+            return Err("--limit is only supported for headless boot".into());
+        }
         return tui::run_boot(&firmware, &kernel, &device_tree, memory_size);
     }
     let machine = Machine::from_boot(&firmware, &kernel, &device_tree, memory_size)?;
-    run_headless(machine, instruction_limit)
+    run_headless(machine, instruction_limit.unwrap_or(u64::MAX))
 }
 
 fn option_path(
@@ -124,8 +131,8 @@ fn option_value<'a>(
 fn parse_size(value: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let (number, multiplier) = match value.as_bytes().last().copied() {
         Some(b'K' | b'k') => (&value[..value.len() - 1], 1024usize),
-        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024usize.pow(2)),
-        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024usize.pow(3)),
+        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024usize * 1024),
+        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024usize * 1024 * 1024),
         _ => (value, 1),
     };
     number
@@ -134,6 +141,36 @@ fn parse_size(value: &str) -> Result<usize, Box<dyn std::error::Error>> {
         .and_then(|number| number.checked_mul(multiplier))
         .filter(|size| *size > 0)
         .ok_or_else(|| format!("invalid memory size: {value}").into())
+}
+
+fn validate_dtb_memory(
+    device_tree: &[u8],
+    memory_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = fdt::Fdt::new(device_tree).map_err(|error| format!("invalid DTB: {error}"))?;
+    let memory = tree
+        .find_node("/memory")
+        .ok_or("DTB does not contain a memory node")?;
+    let mut regions = memory.reg().ok_or("DTB memory node has no reg property")?;
+    let region = regions.next().ok_or("DTB memory node has no regions")?;
+    if regions.next().is_some() {
+        return Err(
+            "DTB describes multiple memory regions; rave requires one contiguous region".into(),
+        );
+    }
+
+    let dtb_start = region.starting_address as usize as u64;
+    let dtb_size = region
+        .size
+        .ok_or("DTB memory region does not specify a size")?;
+    if dtb_start != Machine::LOAD_ADDRESS || dtb_size != memory_size {
+        return Err(format!(
+            "DTB memory region is {dtb_start:#x} + {dtb_size:#x} bytes, but rave is configured for {:#x} + {memory_size:#x} bytes; update the DTB or --memory",
+            Machine::LOAD_ADDRESS
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn run_headless(
@@ -199,5 +236,27 @@ mod tests {
         assert_eq!(parse_size("1024").unwrap(), 1024);
         assert!(parse_size("0").is_err());
         assert!(parse_size("many").is_err());
+    }
+
+    #[test]
+    fn bundled_dtb_matches_default_boot_memory() {
+        validate_dtb_memory(
+            include_bytes!("../demo/rave.dtb"),
+            Machine::BOOT_MEMORY_SIZE,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dtb_memory_mismatch_is_rejected() {
+        let error =
+            validate_dtb_memory(include_bytes!("../demo/rave.dtb"), 64 * 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("update the DTB or --memory"));
+    }
+
+    #[test]
+    fn invalid_dtb_is_rejected() {
+        let error = validate_dtb_memory(b"not a DTB", Machine::BOOT_MEMORY_SIZE).unwrap_err();
+        assert!(error.to_string().starts_with("invalid DTB:"));
     }
 }

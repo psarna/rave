@@ -18,9 +18,10 @@ use rave::decode_helpers::{
 };
 use rave::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, Command, Debugger,
-    Machine, StopReason, MCOUNTEREN_REGISTER_INDEX, MSIP_REGISTER_INDEX, MSTATUS_REGISTER_INDEX,
-    MTIMECMP_REGISTER_INDEX, MTIME_REGISTER_INDEX, PC_REGISTER_INDEX,
-    PLIC_MACHINE_CLAIM_REGISTER_INDEX, PLIC_MACHINE_ENABLE_REGISTER_INDEX,
+    Machine, StopReason, CSR_MCOUNTEREN, CSR_MSTATUS, CSR_SATP, CSR_SCOUNTEREN,
+    INSTRUCTION_SFENCE_VMA, INSTRUCTION_SFENCE_VMA_MASK, MCOUNTEREN_REGISTER_INDEX,
+    MSIP_REGISTER_INDEX, MSTATUS_REGISTER_INDEX, MTIMECMP_REGISTER_INDEX, MTIME_REGISTER_INDEX,
+    PC_REGISTER_INDEX, PLIC_MACHINE_CLAIM_REGISTER_INDEX, PLIC_MACHINE_ENABLE_REGISTER_INDEX,
     PLIC_MACHINE_THRESHOLD_REGISTER_INDEX, PLIC_PENDING_REGISTER_INDEX,
     PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX, PLIC_SUPERVISOR_ENABLE_REGISTER_INDEX,
     PLIC_SUPERVISOR_THRESHOLD_REGISTER_INDEX, PLIC_UART_PRIORITY_REGISTER_INDEX, REGISTER_NAMES,
@@ -69,7 +70,6 @@ const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 const PTE_PPN_SHIFT: u64 = 10;
 const PTE_PPN_MASK: u64 = (1 << 44) - 1;
-const CSR_SATP: u16 = 0x180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchInfo {
@@ -1447,10 +1447,10 @@ fn selected_value(debugger: &Debugger, index: usize) -> u64 {
         }
         PLIC_MACHINE_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_machine_claim(),
         PLIC_SUPERVISOR_CLAIM_REGISTER_INDEX => debugger.machine.bus.plic_supervisor_claim(),
-        SATP_REGISTER_INDEX => debugger.machine.cpu.csr(0x180),
-        MSTATUS_REGISTER_INDEX => debugger.machine.cpu.csr(0x300),
-        MCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(0x306),
-        SCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(0x106),
+        SATP_REGISTER_INDEX => debugger.machine.cpu.csr(CSR_SATP),
+        MSTATUS_REGISTER_INDEX => debugger.machine.cpu.csr(CSR_MSTATUS),
+        MCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(CSR_MCOUNTEREN),
+        SCOUNTEREN_REGISTER_INDEX => debugger.machine.cpu.csr(CSR_SCOUNTEREN),
         _ => debugger.machine.cpu.register(index),
     }
 }
@@ -1539,16 +1539,22 @@ fn set_value(debugger: &mut Debugger, index: usize, value: u64) {
             debugger.machine.bus.complete_plic_supervisor_claim(value);
         }
         SATP_REGISTER_INDEX => {
-            debugger.machine.cpu.set_csr_for_debug(0x180, value);
+            debugger.machine.cpu.set_csr_for_debug(CSR_SATP, value);
         }
         MSTATUS_REGISTER_INDEX => {
-            debugger.machine.cpu.set_csr_for_debug(0x300, value);
+            debugger.machine.cpu.set_csr_for_debug(CSR_MSTATUS, value);
         }
         MCOUNTEREN_REGISTER_INDEX => {
-            debugger.machine.cpu.set_csr_for_debug(0x306, value);
+            debugger
+                .machine
+                .cpu
+                .set_csr_for_debug(CSR_MCOUNTEREN, value);
         }
         SCOUNTEREN_REGISTER_INDEX => {
-            debugger.machine.cpu.set_csr_for_debug(0x106, value);
+            debugger
+                .machine
+                .cpu
+                .set_csr_for_debug(CSR_SCOUNTEREN, value);
         }
         _ if index < REGISTER_NAMES.len() => debugger.machine.cpu.set_register(index, value),
         _ => {}
@@ -1589,7 +1595,7 @@ fn instruction_name(instruction: u32) -> &'static str {
         0x73 if instruction == 0x3020_0073 => "mret",
         0x73 if instruction == 0x1020_0073 => "sret",
         0x73 if instruction == 0x1050_0073 => "wfi",
-        0x73 if instruction & 0xfe00_7fff == 0x1200_0073 => "sfence.vma",
+        0x73 if instruction & INSTRUCTION_SFENCE_VMA_MASK == INSTRUCTION_SFENCE_VMA => "sfence.vma",
         0x73 => "system",
         _ => "unknown",
     }
@@ -2126,20 +2132,20 @@ fn csr_name(address: u16) -> String {
         0x100 => "sstatus".into(),
         0x104 => "sie".into(),
         0x105 => "stvec".into(),
-        0x106 => "scounteren".into(),
+        CSR_SCOUNTEREN => "scounteren".into(),
         0x140 => "sscratch".into(),
         0x141 => "sepc".into(),
         0x142 => "scause".into(),
         0x143 => "stval".into(),
         0x144 => "sip".into(),
-        0x180 => "satp".into(),
-        0x300 => "mstatus".into(),
+        CSR_SATP => "satp".into(),
+        CSR_MSTATUS => "mstatus".into(),
         0x301 => "misa".into(),
         0x302 => "medeleg".into(),
         0x303 => "mideleg".into(),
         0x304 => "mie".into(),
         0x305 => "mtvec".into(),
-        0x306 => "mcounteren".into(),
+        CSR_MCOUNTEREN => "mcounteren".into(),
         0x340 => "mscratch".into(),
         0x341 => "mepc".into(),
         0x342 => "mcause".into(),
@@ -2209,7 +2215,7 @@ fn decode_csr(instruction: u32, debugger: &Debugger) -> Option<CsrInfo> {
 }
 
 fn decode_sfence_vma(instruction: u32) -> Option<(usize, usize)> {
-    (instruction & 0xfe00_7fff == 0x1200_0073).then_some((
+    (instruction & INSTRUCTION_SFENCE_VMA_MASK == INSTRUCTION_SFENCE_VMA).then_some((
         ((instruction >> 15) & 0x1f) as usize,
         ((instruction >> 20) & 0x1f) as usize,
     ))
@@ -2450,19 +2456,19 @@ mod tests {
         assert_eq!(debugger.machine.bus.plic_uart_priority(), 1);
         assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
         assert_eq!(debugger.machine.bus.plic_machine_threshold(), 2);
-        assert_eq!(debugger.machine.cpu.csr(0x300), 1 << 18);
-        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
-        assert_eq!(debugger.machine.cpu.csr(0x106), 3);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MSTATUS), 1 << 18);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MCOUNTEREN), 7);
+        assert_eq!(debugger.machine.cpu.csr(CSR_SCOUNTEREN), 3);
         assert_eq!(
             register_label(PLIC_MACHINE_CLAIM_REGISTER_INDEX),
             "plic_mclaim"
         );
         undo_last_edit(&mut debugger, &mut app);
-        assert_eq!(debugger.machine.cpu.csr(0x106), 0);
+        assert_eq!(debugger.machine.cpu.csr(CSR_SCOUNTEREN), 0);
         undo_last_edit(&mut debugger, &mut app);
-        assert_eq!(debugger.machine.cpu.csr(0x306), 0);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MCOUNTEREN), 0);
         undo_last_edit(&mut debugger, &mut app);
-        assert_eq!(debugger.machine.cpu.csr(0x300), 0);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MSTATUS), 0);
         undo_last_edit(&mut debugger, &mut app);
         assert_eq!(debugger.machine.bus.plic_machine_threshold(), 0);
     }
@@ -2472,9 +2478,9 @@ mod tests {
         let mut debugger = debugger();
         let mut app = App::new();
         execute_command("set mcounteren 7", &mut debugger, &mut app);
-        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MCOUNTEREN), 7);
         execute_command("undo", &mut debugger, &mut app);
-        assert_eq!(debugger.machine.cpu.csr(0x306), 0);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MCOUNTEREN), 0);
     }
 
     #[test]
@@ -2817,8 +2823,8 @@ mod tests {
     #[test]
     fn csr_name_prefers_known_machine_names() {
         assert_eq!(csr_name(0x340), "mscratch");
-        assert_eq!(csr_name(0x306), "mcounteren");
-        assert_eq!(csr_name(0x106), "scounteren");
+        assert_eq!(csr_name(CSR_MCOUNTEREN), "mcounteren");
+        assert_eq!(csr_name(CSR_SCOUNTEREN), "scounteren");
         assert_eq!(csr_name(0x777), "0x777");
     }
 

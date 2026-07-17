@@ -6,7 +6,8 @@ mod machine;
 pub use bus::{Bus, BusError, Region};
 pub use cpu::{
     decode_compressed_instruction, encoded_instruction_size, AddressAccess, AddressTranslation,
-    Cpu, HaltReason, PrivilegeMode, StepError,
+    Cpu, HaltReason, PrivilegeMode, StepError, CSR_MCOUNTEREN, CSR_MSTATUS, CSR_SATP,
+    CSR_SCOUNTEREN, INSTRUCTION_SFENCE_VMA, INSTRUCTION_SFENCE_VMA_MASK,
 };
 pub use debugger::{
     parse_number as debugger_parse_number, Command, CommandError, Debugger, StopReason,

@@ -1,5 +1,8 @@
 use crate::cpu::{decode_compressed_instruction, encoded_instruction_size};
-use crate::{AddressAccess, HaltReason, Machine, MachineError};
+use crate::{
+    AddressAccess, HaltReason, Machine, MachineError, CSR_MCOUNTEREN, CSR_MSTATUS, CSR_SATP,
+    CSR_SCOUNTEREN,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
@@ -397,16 +400,16 @@ impl Debugger {
                 self.machine.bus.complete_plic_supervisor_claim(value);
             }
             SATP_REGISTER_INDEX => {
-                self.machine.cpu.set_csr_for_debug(0x180, value);
+                self.machine.cpu.set_csr_for_debug(CSR_SATP, value);
             }
             MSTATUS_REGISTER_INDEX => {
-                self.machine.cpu.set_csr_for_debug(0x300, value);
+                self.machine.cpu.set_csr_for_debug(CSR_MSTATUS, value);
             }
             MCOUNTEREN_REGISTER_INDEX => {
-                self.machine.cpu.set_csr_for_debug(0x306, value);
+                self.machine.cpu.set_csr_for_debug(CSR_MCOUNTEREN, value);
             }
             SCOUNTEREN_REGISTER_INDEX => {
-                self.machine.cpu.set_csr_for_debug(0x106, value);
+                self.machine.cpu.set_csr_for_debug(CSR_SCOUNTEREN, value);
             }
             _ if index < REGISTER_NAMES.len() => self.machine.cpu.set_register(index, value),
             _ => {}
@@ -523,7 +526,7 @@ mod tests {
 
         assert_eq!(debugger.machine.bus.uart_interrupt_enable(), 1);
         assert_eq!(debugger.machine.bus.plic_machine_enable(), 1 << 10);
-        assert_eq!(debugger.machine.cpu.csr(0x306), 7);
+        assert_eq!(debugger.machine.cpu.csr(CSR_MCOUNTEREN), 7);
     }
 
     #[test]
