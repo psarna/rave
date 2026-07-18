@@ -12,12 +12,16 @@
         <div class="brand">
           <img class="logo" src="./demo/rave.png" alt="rave">
           <div>
-            <p class="eyebrow">RV64IMAC emulator</p>
-            <h1>rave in your browser</h1>
+            <p class="eyebrow">RV64IMAC // WEB EMULATOR</p>
+            <h1>rave</h1>
             <p class="subtitle">Boot firmware and a kernel, then talk to the guest over its emulated 16550 UART.</p>
           </div>
         </div>
-        <div class="status"><span></span><output id="status">stopped</output></div>
+        <div class="board-id">
+          <span>RAVE-64</span>
+          <span>REV.WASM</span>
+          <div class="status"><i></i><output id="status">stopped</output></div>
+        </div>
       </header>
 
       <section class="controls" aria-label="Boot configuration">
@@ -51,23 +55,25 @@
       </section>
 
       <div class="runtime">
-        <section class="terminal-shell">
-          <div class="terminal-bar">
-            <span>UART0 · 16550</span>
-          </div>
-          <pre id="terminal" tabindex="0" aria-label="UART terminal output"></pre>
-          <form id="uart-form" class="uart-input-row">
-            <label for="uart-input">UART input</label>
-            <span aria-hidden="true">›</span>
-            <input id="uart-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a line and press Enter">
-            <button type="submit">Send</button>
-          </form>
-        </section>
+        <div class="terminal-viewport">
+          <section class="terminal-shell">
+            <div class="terminal-bar">
+              <span>J1 // UART0 · 16550</span>
+            </div>
+            <pre id="terminal" tabindex="0" aria-label="UART terminal output"></pre>
+            <form id="uart-form" class="uart-input-row">
+              <label for="uart-input">UART RX</label>
+              <span aria-hidden="true">›</span>
+              <input id="uart-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a line and press Enter">
+              <button type="submit">Send</button>
+            </form>
+          </section>
+        </div>
 
         <aside class="register-panel" aria-label="Live registers">
           <div class="register-bar">
-            <span>Registers</span>
-            <span>Live</span>
+            <span>U1 // REGISTER BANK</span>
+            <span>LIVE</span>
           </div>
           <div id="register-list" class="register-list">
             <p>Boot a guest to inspect its state.</p>
@@ -77,6 +83,6 @@
 
       <p class="note">Custom boot images use the bundled 128 MiB device tree. No files leave your browser.</p>
     </main>
-    <script defer src="./web/app.js"></script>
+    <script defer src="./web/app.js?v=20260718-1"></script>
   </body>
 </html>

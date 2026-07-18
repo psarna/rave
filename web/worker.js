@@ -1,4 +1,4 @@
-import init, { WasmMachine } from "./pkg/rave.js";
+import init, { WasmMachine } from "./pkg/rave.js?v=20260718-1";
 
 let machine = null;
 let generation = 0;
@@ -57,6 +57,9 @@ function tick(current) {
 }
 
 function postRegisters() {
+  if (typeof machine.register_snapshot !== "function") {
+    throw new Error("Browser assets are out of sync; reload while bypassing the cache");
+  }
   self.postMessage({ type: "registers", value: machine.register_snapshot() });
 }
 

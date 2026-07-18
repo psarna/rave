@@ -83,7 +83,7 @@ async function start() {
           dtb: await fetchBytes("./demo/rave.dtb"),
           memorySize: BOOT_MEMORY,
         };
-    worker = new Worker("./web/worker.js", { type: "module" });
+    worker = new Worker("./web/worker.js?v=20260718-1", { type: "module" });
     worker.onmessage = receive;
     worker.onerror = (event) => setStatus(event.message, true);
     const transfers = Object.values(message).filter(
