@@ -150,6 +150,8 @@ button.primary { color: #041316; border-color: #8ce4df; background: linear-gradi
 .register-row span { overflow: hidden; color: #78919b; text-overflow: ellipsis; }
 .register-row output { color: #c5d4d2; font: inherit; }
 .note { flex: 0 0 auto; margin-top: 7px; color: #76909a; font-size: .62rem; letter-spacing: .04em; }
+.note a { color: var(--signal); text-underline-offset: 2px; }
+.note a:hover { color: var(--silk); }
 [hidden] { display: none !important; }
 
 @media (min-width: 901px) and (min-height: 720px) {
