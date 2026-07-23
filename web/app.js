@@ -8,6 +8,11 @@ const presets = {
     shim: { label: "Minimal test boot shim", url: "./demo/boot_shim.bin" },
   },
   kernel: {
+    linux: {
+      label: "Linux 6.18.7 + Buildroot",
+      url: "./demo/linux/Image?v=20260723-1",
+      initrdUrl: "./demo/linux/rootfs.cpio?v=20260723-1",
+    },
     uart_echo: { label: "uart_echo", url: "./demo/boot_payload.bin" },
   },
   raw: {
@@ -80,11 +85,14 @@ async function start() {
             presets.firmware,
           ),
           kernel: await selectedBytes(kernel, $("#kernel-upload"), presets.kernel),
-          initrd: await optionalBytes($("#initrd-upload")),
+          initrd: await selectedInitrd(
+            $("#initrd-upload"),
+            presets.kernel[kernel.value],
+          ),
           dtb: await fetchBytes("./demo/rave.dtb"),
           memorySize: BOOT_MEMORY,
         };
-    worker = new Worker("./web/worker.js?v=20260718-1", { type: "module" });
+    worker = new Worker("./web/worker.js?v=20260723-1", { type: "module" });
     worker.onmessage = receive;
     worker.onerror = (event) => setStatus(event.message, true);
     const transfers = Object.values(message).filter(
@@ -153,8 +161,9 @@ async function selectedBytes(select, upload, group) {
   return fetchBytes(group[select.value].url);
 }
 
-async function optionalBytes(upload) {
-  return upload.files[0] ? upload.files[0].arrayBuffer() : null;
+async function selectedInitrd(upload, kernelPreset) {
+  if (upload.files[0]) return upload.files[0].arrayBuffer();
+  return kernelPreset.initrdUrl ? fetchBytes(kernelPreset.initrdUrl) : null;
 }
 
 async function fetchBytes(url) {

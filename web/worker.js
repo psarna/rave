@@ -1,4 +1,4 @@
-import init, { WasmMachine } from "./pkg/rave.js?v=20260718-1";
+import init, { WasmMachine } from "./pkg/rave.js?v=20260723-1";
 
 let machine = null;
 let generation = 0;
