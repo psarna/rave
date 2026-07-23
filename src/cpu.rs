@@ -178,6 +178,7 @@ const S_INTERRUPT_MASK: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP;
 const M_INTERRUPT_MASK: u64 = MIP_MSIP | MIP_MTIP | MIP_MEIP;
 const MIE_WRITABLE_MASK: u64 = S_INTERRUPT_MASK | M_INTERRUPT_MASK;
 const MIP_WRITABLE_MASK: u64 = S_INTERRUPT_MASK;
+const SIP_WRITABLE_MASK: u64 = MIP_SSIP;
 const MTVEC_WRITABLE_MASK: u64 = !0b10;
 const MEPC_WRITABLE_MASK: u64 = !1;
 const MCAUSE_WRITABLE_MASK: u64 = u64::MAX;
@@ -1163,6 +1164,10 @@ impl Cpu {
             .csrs
             .read(address)
             .ok_or_else(|| illegal(pc, instruction.raw))?;
+        let stored_value = self
+            .csrs
+            .stored_value(address)
+            .ok_or_else(|| illegal(pc, instruction.raw))?;
         let register_operand = self.registers[instruction.rs1];
         let immediate_operand = instruction.rs1 as u64;
 
@@ -1170,20 +1175,20 @@ impl Cpu {
             FUNCT_CSRRW => (true, register_operand),
             FUNCT_CSRRS => (
                 instruction.rs1 != ZERO_REGISTER,
-                old_value | register_operand,
+                stored_value | register_operand,
             ),
             FUNCT_CSRRC => (
                 instruction.rs1 != ZERO_REGISTER,
-                old_value & !register_operand,
+                stored_value & !register_operand,
             ),
             FUNCT_CSRRWI => (true, immediate_operand),
             FUNCT_CSRRSI => (
                 instruction.rs1 != ZERO_REGISTER,
-                old_value | immediate_operand,
+                stored_value | immediate_operand,
             ),
             FUNCT_CSRRCI => (
                 instruction.rs1 != ZERO_REGISTER,
-                old_value & !immediate_operand,
+                stored_value & !immediate_operand,
             ),
             _ => return Err(illegal(pc, instruction.raw)),
         };
@@ -1955,6 +1960,14 @@ fn csr_address(instruction: u32) -> u16 {
 }
 
 impl CsrFile {
+    fn stored_value(&self, address: u16) -> Option<u64> {
+        match address {
+            CSR_MIP => Some(self.mip),
+            CSR_SIP => Some(self.mip & S_INTERRUPT_MASK),
+            _ => self.read(address),
+        }
+    }
+
     fn read(&self, address: u16) -> Option<u64> {
         match address {
             CSR_MVENDORID | CSR_MARCHID | CSR_MIMPID | CSR_MHARTID => Some(0),
@@ -2011,7 +2024,7 @@ impl CsrFile {
             CSR_SEPC => self.sepc = value & MEPC_WRITABLE_MASK,
             CSR_SCAUSE => self.scause = value & MCAUSE_WRITABLE_MASK,
             CSR_STVAL => self.stval = value & MTVAL_WRITABLE_MASK,
-            CSR_SIP => self.mip = (self.mip & !S_INTERRUPT_MASK) | (value & MIP_WRITABLE_MASK),
+            CSR_SIP => self.mip = (self.mip & !SIP_WRITABLE_MASK) | (value & SIP_WRITABLE_MASK),
             CSR_SATP => self.satp = write_satp(value),
             _ => return None,
         }
@@ -2828,8 +2841,8 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MSTATUS) & MSTATUS_MIE, 0);
         assert_eq!(cpu.csr(CSR_SIE), S_INTERRUPT_MASK);
         assert_eq!(cpu.csr(CSR_MIE), S_INTERRUPT_MASK);
-        assert_eq!(cpu.csr(CSR_SIP), S_INTERRUPT_MASK);
-        assert_eq!(cpu.csr(CSR_MIP), S_INTERRUPT_MASK);
+        assert_eq!(cpu.csr(CSR_SIP), MIP_SSIP);
+        assert_eq!(cpu.csr(CSR_MIP), MIP_SSIP);
         assert_eq!(cpu.csr(CSR_SATP), 0);
     }
 
@@ -3251,9 +3264,39 @@ mod tests {
         cpu.refresh_interrupt_pending(&bus);
         assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, MIP_SEIP);
 
+        // A supervisor read-modify-write while the external line is asserted
+        // must not copy the read-only SEIP bit into software-pending state.
+        let sip = cpu.csr(CSR_SIP);
+        cpu.csrs.write(CSR_SIP, sip).unwrap();
+
         assert_eq!(bus.read_u8(crate::bus::UART_START).unwrap(), b'X');
         cpu.refresh_interrupt_pending(&bus);
         assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, 0);
+    }
+
+    #[test]
+    fn mip_rmw_does_not_latch_external_seip_into_software_state() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        bus.push_uart_input(b"X");
+        bus.write_u8(crate::bus::UART_START + 1, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 10 * 4, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 0x2080, 1 << 10)
+            .unwrap();
+        cpu.set_register(1, MIP_STIP);
+        bus.write_u32(
+            DRAM_START,
+            encode_csr(u32::from(CSR_MIP), FUNCT_CSRRS, 1, 0),
+        )
+        .unwrap();
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, MIP_SEIP);
+
+        assert_eq!(bus.read_u8(crate::bus::UART_START).unwrap(), b'X');
+        cpu.refresh_interrupt_pending(&bus);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, 0);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_STIP, MIP_STIP);
     }
 
     #[test]

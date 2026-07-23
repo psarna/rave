@@ -59,6 +59,30 @@ fn compiles_and_runs_a_plic_uart_interrupt_guest() {
 }
 
 #[test]
+fn plic_uart_interrupt_repeats_until_the_receive_queue_is_empty() {
+    let binary = compile_guest("plic_repeat", "rv64im_zicsr");
+    let image = std::fs::read(binary).unwrap();
+    let mut machine =
+        Machine::from_raw(&image, Machine::LOAD_ADDRESS, Machine::MEMORY_SIZE).unwrap();
+
+    for _ in 0..100 {
+        assert_eq!(machine.step().unwrap(), None);
+    }
+    for byte in b"0123456789abcdefghijklmnopqrstuv" {
+        machine.bus.push_uart_input(&[*byte]);
+        for _ in 0..100 {
+            if let Some(reason) = machine.step().unwrap() {
+                assert_eq!(reason, HaltReason::Breakpoint { code: 0 });
+                assert_eq!(*byte, b'v');
+                assert_eq!(machine.bus.uart_output(), b"R");
+                return;
+            }
+        }
+    }
+    panic!("guest did not finish after the final UART interrupt");
+}
+
+#[test]
 fn compiles_and_runs_an_sv39_guest() {
     let result = compile_and_run_guest_with_march("sv39", "rv64im_zicsr", b"", 100_000);
     assert_eq!(result.reason, HaltReason::Breakpoint { code: 0 });

@@ -42,7 +42,8 @@ An optional external initrd is page-aligned below the device tree; rave adds
 its exact range to the device tree's `/chosen` node for Linux.
 It starts hart 0 with the standard firmware arguments (`a0 = 0`, `a1 = DTB`)
 and streams UART output while the guest runs. Headless boot runs until the guest
-halts or the process is stopped; use `--limit` to impose an instruction cap:
+halts or the process is stopped; press Ctrl-] to exit a headless terminal, or
+use `--limit` to impose an instruction cap:
 
 ```sh
 cargo run --release -- boot \
