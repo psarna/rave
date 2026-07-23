@@ -13,6 +13,7 @@ export class WasmMachine {
     free(): void;
     [Symbol.dispose](): void;
     static boot(firmware: Uint8Array, kernel: Uint8Array, device_tree: Uint8Array, memory_size: number): WasmMachine;
+    static bootWithInitrd(firmware: Uint8Array, kernel: Uint8Array, initrd: Uint8Array, device_tree: Uint8Array, memory_size: number): WasmMachine;
     push_uart_input(input: Uint8Array): void;
     static raw(image: Uint8Array, memory_size: number): WasmMachine;
     /**
@@ -38,6 +39,7 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_wasmmachine_free: (a: number, b: number) => void;
     readonly wasmmachine_boot: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
+    readonly wasmmachine_bootWithInitrd: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
     readonly wasmmachine_push_uart_input: (a: number, b: number, c: number) => void;
     readonly wasmmachine_raw: (a: number, b: number, c: number) => [number, number, number];
     readonly wasmmachine_register_snapshot: (a: number) => [number, number];

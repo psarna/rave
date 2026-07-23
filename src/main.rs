@@ -12,7 +12,7 @@ use std::{
 
 const USAGE: &str = "usage:
   rave [--interactive] <guest.bin>
-  rave boot [--interactive] --firmware <fw_jump.bin> --kernel <Image> --dtb <rave.dtb> [--memory <size>] [--limit <instructions>]
+  rave boot [--interactive] --firmware <fw_jump.bin> --kernel <Image> [--initrd <rootfs.cpio>] --dtb <rave.dtb> [--memory <size>] [--limit <instructions>]
 
 sizes accept K, M, and G suffixes (default boot memory: 128M)
 boot runs until the guest halts by default; --limit is headless-only";
@@ -61,6 +61,7 @@ fn run_raw(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut firmware = None;
     let mut kernel = None;
+    let mut initrd = None;
     let mut device_tree = None;
     let mut memory_size = Machine::BOOT_MEMORY_SIZE;
     let mut instruction_limit = None;
@@ -76,6 +77,7 @@ fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--interactive" | "-i" => interactive = true,
             "--firmware" => firmware = Some(option_path(arguments, &mut index, argument)?),
             "--kernel" => kernel = Some(option_path(arguments, &mut index, argument)?),
+            "--initrd" => initrd = Some(option_path(arguments, &mut index, argument)?),
             "--dtb" => device_tree = Some(option_path(arguments, &mut index, argument)?),
             "--memory" => {
                 let value = option_value(arguments, &mut index, argument)?;
@@ -96,15 +98,28 @@ fn run_boot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let firmware = fs::read(firmware.ok_or("boot requires --firmware")?)?;
     let kernel = fs::read(kernel.ok_or("boot requires --kernel")?)?;
+    let initrd = initrd.map(fs::read).transpose()?;
     let device_tree = fs::read(device_tree.ok_or("boot requires --dtb")?)?;
     validate_dtb_memory(&device_tree, memory_size)?;
     if interactive {
         if instruction_limit.is_some() {
             return Err("--limit is only supported for headless boot".into());
         }
-        return tui::run_boot(&firmware, &kernel, &device_tree, memory_size);
+        return tui::run_boot_with_initrd(
+            &firmware,
+            &kernel,
+            initrd.as_deref(),
+            &device_tree,
+            memory_size,
+        );
     }
-    let machine = Machine::from_boot(&firmware, &kernel, &device_tree, memory_size)?;
+    let machine = Machine::from_boot_with_initrd(
+        &firmware,
+        &kernel,
+        initrd.as_deref(),
+        &device_tree,
+        memory_size,
+    )?;
     run_headless(machine, instruction_limit.unwrap_or(u64::MAX))
 }
 

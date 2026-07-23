@@ -13,12 +13,20 @@ self.onmessage = async ({ data }) => {
       machine?.free();
       machine = data.mode === "raw"
         ? WasmMachine.raw(new Uint8Array(data.image), data.memorySize)
-        : WasmMachine.boot(
-            new Uint8Array(data.firmware),
-            new Uint8Array(data.kernel),
-            new Uint8Array(data.dtb),
-            data.memorySize,
-          );
+        : data.initrd
+          ? WasmMachine.bootWithInitrd(
+              new Uint8Array(data.firmware),
+              new Uint8Array(data.kernel),
+              new Uint8Array(data.initrd),
+              new Uint8Array(data.dtb),
+              data.memorySize,
+            )
+          : WasmMachine.boot(
+              new Uint8Array(data.firmware),
+              new Uint8Array(data.kernel),
+              new Uint8Array(data.dtb),
+              data.memorySize,
+            );
       chunkCount = 0;
       self.postMessage({ type: "status", value: "running" });
       postRegisters();

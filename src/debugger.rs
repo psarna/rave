@@ -202,6 +202,7 @@ enum ImageLayout {
     Boot {
         firmware: Vec<u8>,
         kernel: Vec<u8>,
+        initrd: Option<Vec<u8>>,
         device_tree: Vec<u8>,
         memory_size: usize,
     },
@@ -218,9 +219,16 @@ impl ImageLayout {
             Self::Boot {
                 firmware,
                 kernel,
+                initrd,
                 device_tree,
                 memory_size,
-            } => Machine::from_boot(firmware, kernel, device_tree, *memory_size),
+            } => Machine::from_boot_with_initrd(
+                firmware,
+                kernel,
+                initrd.as_deref(),
+                device_tree,
+                *memory_size,
+            ),
         }
     }
 }
@@ -247,9 +255,20 @@ impl Debugger {
         device_tree: &[u8],
         memory_size: usize,
     ) -> Result<Self, MachineError> {
+        Self::from_boot_with_initrd(firmware, kernel, None, device_tree, memory_size)
+    }
+
+    pub fn from_boot_with_initrd(
+        firmware: &[u8],
+        kernel: &[u8],
+        initrd: Option<&[u8]>,
+        device_tree: &[u8],
+        memory_size: usize,
+    ) -> Result<Self, MachineError> {
         let layout = ImageLayout::Boot {
             firmware: firmware.to_vec(),
             kernel: kernel.to_vec(),
+            initrd: initrd.map(<[u8]>::to_vec),
             device_tree: device_tree.to_vec(),
             memory_size,
         };

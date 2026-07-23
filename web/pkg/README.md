@@ -38,6 +38,8 @@ receive data for the guest.
 
 The `boot` command loads OpenSBI at `0x8000_0000`, a kernel at
 `0x8020_0000`, and an 8-byte-aligned device tree near the top of guest RAM.
+An optional external initrd is page-aligned below the device tree; rave adds
+its exact range to the device tree's `/chosen` node for Linux.
 It starts hart 0 with the standard firmware arguments (`a0 = 0`, `a1 = DTB`)
 and streams UART output while the guest runs. Headless boot runs until the guest
 halts or the process is stopped; use `--limit` to impose an instruction cap:
@@ -46,23 +48,28 @@ halts or the process is stopped; use `--limit` to impose an instruction cap:
 cargo run --release -- boot \
   --firmware demo/fw_jump.bin \
   --kernel path/to/Image \
+  --initrd path/to/rootfs.cpio \
   --dtb demo/rave.dtb \
   --memory 128M
 ```
 
+Omit `--initrd` when the kernel has a built-in initramfs or does not need one.
+The external image may be an uncompressed or kernel-supported compressed CPIO
+archive. rave treats it as opaque data; Linux unpacks it and runs `/init`.
+
 The precompiled `demo/rave.dtb` device tree describes the current single-hart platform, UART,
 CLINT, PLIC, and 128 MiB default memory layout. rave rejects a DTB whose single
 contiguous memory region does not match `--memory`; if that option is changed,
-update the memory node in the device tree to match. A Linux kernel with a
-built-in initramfs can boot without a block device; virtio block storage is
-still future work. Recompile the supplied source after editing it with:
+update the memory node in the device tree to match. A Linux kernel with an
+external or built-in initramfs can boot without a block device; virtio block
+storage is still future work. Recompile the supplied source after editing it with:
 
 ```sh
 dtc -I dts -O dtb -o demo/rave.dtb demo/rave.dts
 ```
 
 Add `--interactive` after `boot` to inspect OpenSBI and its payload in the TUI.
-The debugger's `start` command restores all three boot images and the firmware
+The debugger's `start` command restores all boot images and the firmware
 register contract.
 
 `demo/fw_jump.bin` is real OpenSBI 1.7 firmware, not a rave reimplementation.
@@ -192,10 +199,7 @@ Install `wasm-pack`, then build and serve the repository root:
 python3 -m http.server 8000
 ```
 
-Open `http://localhost:8000/`. The site must be served over HTTP rather
-than opened with `file://`, because it fetches the WASM and guest images. A
-GitHub Pages can publish the repository root directly; the root `index.html`
-loads `web/`, `demo/`, and the generated `web/pkg/` directory.
+... or just enjoy https://rave.sarna.dev
 
 Virtio is not implemented yet. The firmware boot path is present, while full
 Linux compatibility may still expose privileged-architecture gaps that are not

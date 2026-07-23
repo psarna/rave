@@ -45,6 +45,29 @@ export class WasmMachine {
         return WasmMachine.__wrap(ret[0]);
     }
     /**
+     * @param {Uint8Array} firmware
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} initrd
+     * @param {Uint8Array} device_tree
+     * @param {number} memory_size
+     * @returns {WasmMachine}
+     */
+    static bootWithInitrd(firmware, kernel, initrd, device_tree, memory_size) {
+        const ptr0 = passArray8ToWasm0(firmware, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(initrd, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passArray8ToWasm0(device_tree, wasm.__wbindgen_malloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmachine_bootWithInitrd(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, memory_size);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMachine.__wrap(ret[0]);
+    }
+    /**
      * @param {Uint8Array} input
      */
     push_uart_input(input) {

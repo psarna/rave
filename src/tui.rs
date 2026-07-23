@@ -246,15 +246,17 @@ pub fn run(image: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     )?)
 }
 
-pub fn run_boot(
+pub fn run_boot_with_initrd(
     firmware: &[u8],
     kernel: &[u8],
+    initrd: Option<&[u8]>,
     device_tree: &[u8],
     memory_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_debugger(Debugger::from_boot(
+    run_debugger(Debugger::from_boot_with_initrd(
         firmware,
         kernel,
+        initrd,
         device_tree,
         memory_size,
     )?)

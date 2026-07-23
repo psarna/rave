@@ -40,6 +40,28 @@ impl WasmMachine {
         })
     }
 
+    #[wasm_bindgen(js_name = bootWithInitrd)]
+    pub fn boot_with_initrd(
+        firmware: &[u8],
+        kernel: &[u8],
+        initrd: &[u8],
+        device_tree: &[u8],
+        memory_size: usize,
+    ) -> Result<WasmMachine, JsValue> {
+        let machine = Machine::from_boot_with_initrd(
+            firmware,
+            kernel,
+            Some(initrd),
+            device_tree,
+            memory_size,
+        )
+        .map_err(js_error)?;
+        Ok(Self {
+            machine,
+            uart_cursor: 0,
+        })
+    }
+
     /// Runs at most `instructions` guest instructions.
     ///
     /// Returns `running`, `waiting`, or `halted:<debug reason>`. A UART wait

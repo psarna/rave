@@ -80,6 +80,7 @@ async function start() {
             presets.firmware,
           ),
           kernel: await selectedBytes(kernel, $("#kernel-upload"), presets.kernel),
+          initrd: await optionalBytes($("#initrd-upload")),
           dtb: await fetchBytes("./demo/rave.dtb"),
           memorySize: BOOT_MEMORY,
         };
@@ -150,6 +151,10 @@ function stop(label) {
 async function selectedBytes(select, upload, group) {
   if (upload.files[0]) return upload.files[0].arrayBuffer();
   return fetchBytes(group[select.value].url);
+}
+
+async function optionalBytes(upload) {
+  return upload.files[0] ? upload.files[0].arrayBuffer() : null;
 }
 
 async function fetchBytes(url) {
