@@ -41,6 +41,7 @@ let worker = null;
 const uartHistory = [];
 let uartHistoryIndex = 0;
 let uartHistoryDraft = "";
+let uartStagedLine = "";
 
 if (location.protocol === "file:") {
   setStatus("serve this folder over HTTP to boot", true);
@@ -58,16 +59,18 @@ $("#clear").addEventListener("click", () => ansiTerminal.clear());
 $("#uart-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (!worker) return;
-  const line = uartInput.value;
+  const line = uartStagedLine + uartInput.value;
   if (line && uartHistory.at(-1) !== line) uartHistory.push(line);
   uartHistoryIndex = uartHistory.length;
   uartHistoryDraft = "";
+  uartStagedLine = "";
   setStatus("running");
-  sendUart(`${line}\n`);
+  sendUart(`${uartInput.value}\n`);
   uartInput.value = "";
 });
 uartInput.addEventListener("keydown", (event) => {
-  if (event.key === "ArrowUp") recallUartHistory(-1, event);
+  if (event.key === "Tab") completeUartInput(event);
+  else if (event.key === "ArrowUp") recallUartHistory(-1, event);
   else if (event.key === "ArrowDown") recallUartHistory(1, event);
 });
 terminalViewport.addEventListener("click", () => uartInput.focus());
@@ -162,6 +165,16 @@ function sendUart(value) {
   if (!worker) return;
   const bytes = encoder.encode(value);
   worker.postMessage({ type: "uart", bytes }, [bytes.buffer]);
+}
+
+function completeUartInput(event) {
+  event.preventDefault();
+  if (!worker) return;
+  uartStagedLine += uartInput.value;
+  sendUart(`${uartInput.value}\t`);
+  uartInput.value = "";
+  uartHistoryIndex = uartHistory.length;
+  uartHistoryDraft = "";
 }
 
 function recallUartHistory(direction, event) {
