@@ -29,7 +29,8 @@ const mode = $("#mode");
 const firmware = $("#firmware");
 const kernel = $("#kernel");
 const raw = $("#raw");
-const terminal = $("#terminal");
+const terminal = $("#terminal-output");
+const terminalViewport = $("#terminal");
 const uartInput = $("#uart-input");
 const registerList = $("#register-list");
 const status = $("#status");
@@ -37,6 +38,9 @@ let decoder = new TextDecoder();
 const encoder = new TextEncoder();
 let ansiTerminal;
 let worker = null;
+const uartHistory = [];
+let uartHistoryIndex = 0;
+let uartHistoryDraft = "";
 
 if (location.protocol === "file:") {
   setStatus("serve this folder over HTTP to boot", true);
@@ -54,11 +58,19 @@ $("#clear").addEventListener("click", () => ansiTerminal.clear());
 $("#uart-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (!worker) return;
+  const line = uartInput.value;
+  if (line && uartHistory.at(-1) !== line) uartHistory.push(line);
+  uartHistoryIndex = uartHistory.length;
+  uartHistoryDraft = "";
   setStatus("running");
-  sendUart(`${uartInput.value}\n`);
+  sendUart(`${line}\n`);
   uartInput.value = "";
 });
-terminal.addEventListener("click", () => uartInput.focus());
+uartInput.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowUp") recallUartHistory(-1, event);
+  else if (event.key === "ArrowDown") recallUartHistory(1, event);
+});
+terminalViewport.addEventListener("click", () => uartInput.focus());
 
 async function start() {
   if (location.protocol === "file:") {
@@ -110,7 +122,7 @@ async function start() {
 function receive({ data }) {
   if (data.type === "uart") {
     ansiTerminal.write(decoder.decode(data.bytes, { stream: true }));
-    terminal.scrollTop = terminal.scrollHeight;
+    terminalViewport.scrollTop = terminalViewport.scrollHeight;
   } else if (data.type === "status") {
     setStatus(data.value);
   } else if (data.type === "registers") {
@@ -150,6 +162,23 @@ function sendUart(value) {
   if (!worker) return;
   const bytes = encoder.encode(value);
   worker.postMessage({ type: "uart", bytes }, [bytes.buffer]);
+}
+
+function recallUartHistory(direction, event) {
+  if (uartHistory.length === 0) return;
+  event.preventDefault();
+
+  if (direction < 0) {
+    if (uartHistoryIndex === uartHistory.length) uartHistoryDraft = uartInput.value;
+    uartHistoryIndex = Math.max(0, uartHistoryIndex - 1);
+    uartInput.value = uartHistory[uartHistoryIndex];
+  } else {
+    uartHistoryIndex = Math.min(uartHistory.length, uartHistoryIndex + 1);
+    uartInput.value = uartHistoryIndex === uartHistory.length
+      ? uartHistoryDraft
+      : uartHistory[uartHistoryIndex];
+  }
+  uartInput.setSelectionRange(uartInput.value.length, uartInput.value.length);
 }
 
 function stop(label) {

@@ -117,22 +117,20 @@ button.primary { color: #041316; border-color: #8ce4df; background: linear-gradi
   min-width: 80ch; min-height: 0; overflow: auto; margin: 0; padding: 16px; outline: none;
   color: #8bf1e9; background: #03090d;
   font: 13px/1.48 "SFMono-Regular", Consolas, monospace;
-  white-space: pre; tab-size: 8; text-shadow: 0 0 7px #55c9c855;
+  white-space: pre-wrap; tab-size: 8; text-shadow: 0 0 7px #55c9c855;
   scrollbar-color: var(--trace-dim) #071017;
 }
+#terminal-output { display: inline; margin: 0; font: inherit; white-space: pre-wrap; }
 .uart-input-row {
-  display: grid; position: relative; z-index: 1;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
-  align-items: center; gap: 9px; padding: 9px 12px;
-  border-top: 1px solid #2d6372; background: #0b1c24;
+  display: inline; margin: 0; padding: 0;
 }
-.uart-input-row label { color: #78b6c2; }
-.uart-input-row span { color: var(--signal); font-size: 1rem; font-weight: 700; }
 .uart-input-row input {
-  min-width: 0; padding: 8px 10px; border: 1px solid #315969; border-radius: 1px; outline: none;
-  color: #d5fffb; background: #03090d; font: 13px "SFMono-Regular", Consolas, monospace;
+  width: min(40ch, calc(100% - 2ch)); min-width: 2ch; padding: 0;
+  border: 0; border-radius: 0; outline: none;
+  color: #d5fffb; background: transparent; font: inherit;
+  line-height: inherit; text-shadow: inherit; caret-color: var(--signal);
 }
-.uart-input-row button { padding: 7px 12px; }
+.uart-input-row input:focus { border: 0; box-shadow: none; }
 .register-panel { min-height: 0; overflow: hidden; }
 .register-bar span:last-child { color: var(--signal); }
 .register-list {

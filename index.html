@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>rave — RISC-V in the browser</title>
-    <link rel="stylesheet" href="./web/style.css">
+    <link rel="stylesheet" href="./web/style.css?v=20260723-3">
   </head>
   <body>
     <main>
@@ -63,13 +63,7 @@
             <div class="terminal-bar">
               <span>J1 // UART0 · 16550</span>
             </div>
-            <pre id="terminal" tabindex="0" aria-label="UART terminal output"></pre>
-            <form id="uart-form" class="uart-input-row">
-              <label for="uart-input">UART RX</label>
-              <span aria-hidden="true">›</span>
-              <input id="uart-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a line and press Enter">
-              <button type="submit">Send</button>
-            </form>
+            <div id="terminal" tabindex="0" aria-label="UART terminal"><pre id="terminal-output"></pre><form id="uart-form" class="uart-input-row"><input id="uart-input" type="text" autocomplete="off" spellcheck="false" aria-label="UART input" autofocus></form></div>
           </section>
         </div>
 
@@ -89,6 +83,6 @@
         rave is an <a href="https://github.com/psarna/rave">open-source project on GitHub</a>.
       </p>
     </main>
-    <script defer src="./web/app.js?v=20260723-2"></script>
+    <script defer src="./web/app.js?v=20260723-3"></script>
   </body>
 </html>
