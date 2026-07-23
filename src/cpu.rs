@@ -365,6 +365,7 @@ struct CsrFile {
     mcause: u64,
     mtval: u64,
     mip: u64,
+    supervisor_external_interrupt: bool,
     stvec: u64,
     scounteren: u64,
     sscratch: u64,
@@ -1094,13 +1095,11 @@ impl Cpu {
         if bus.machine_external_interrupt_pending() {
             self.csrs.mip |= MIP_MEIP;
         }
-        if bus.supervisor_external_interrupt_pending() {
-            self.csrs.mip |= MIP_SEIP;
-        }
+        self.csrs.supervisor_external_interrupt = bus.supervisor_external_interrupt_pending();
     }
 
     fn pending_interrupt(&self) -> Option<u64> {
-        let pending = self.csrs.mie & self.csrs.mip;
+        let pending = self.csrs.mie & self.csrs.effective_mip();
         if self.machine_interrupts_enabled() {
             let machine_pending = pending & !self.csrs.mideleg;
             if machine_pending & MIP_MEIP != 0 {
@@ -1970,7 +1969,7 @@ impl CsrFile {
             CSR_MEPC => Some(self.mepc),
             CSR_MCAUSE => Some(self.mcause),
             CSR_MTVAL => Some(self.mtval),
-            CSR_MIP => Some(self.mip),
+            CSR_MIP => Some(self.effective_mip()),
             CSR_SSTATUS => Some(self.mstatus & SSTATUS_WRITABLE_MASK),
             CSR_SIE => Some(self.mie & S_INTERRUPT_MASK),
             CSR_STVEC => Some(self.stvec),
@@ -1979,7 +1978,7 @@ impl CsrFile {
             CSR_SEPC => Some(self.sepc),
             CSR_SCAUSE => Some(self.scause),
             CSR_STVAL => Some(self.stval),
-            CSR_SIP => Some(self.mip & S_INTERRUPT_MASK),
+            CSR_SIP => Some(self.effective_mip() & S_INTERRUPT_MASK),
             CSR_SATP => Some(self.satp),
             CSR_CYCLE => Some(self.cycle),
             CSR_TIME => Some(self.cycle),
@@ -2036,6 +2035,15 @@ impl CsrFile {
     fn retire_instruction(&mut self) {
         self.cycle = self.cycle.wrapping_add(1);
         self.instret = self.instret.wrapping_add(1);
+    }
+
+    fn effective_mip(&self) -> u64 {
+        self.mip
+            | if self.supervisor_external_interrupt {
+                MIP_SEIP
+            } else {
+                0
+            }
     }
 }
 
@@ -3228,6 +3236,24 @@ mod tests {
         assert_eq!(cpu.csr(CSR_MIP) & MIP_MEIP, MIP_MEIP);
         assert_eq!(cpu.register(1), 0);
         assert_eq!(cpu.csr(CSR_INSTRET), 0);
+    }
+
+    #[test]
+    fn supervisor_external_pending_clears_when_plic_line_deasserts() {
+        let mut cpu = Cpu::new(DRAM_START);
+        let mut bus = Bus::new(128);
+        bus.push_uart_input(b"X");
+        bus.write_u8(crate::bus::UART_START + 1, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 10 * 4, 1).unwrap();
+        bus.write_u32(crate::bus::PLIC_START + 0x2080, 1 << 10)
+            .unwrap();
+
+        cpu.refresh_interrupt_pending(&bus);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, MIP_SEIP);
+
+        assert_eq!(bus.read_u8(crate::bus::UART_START).unwrap(), b'X');
+        cpu.refresh_interrupt_pending(&bus);
+        assert_eq!(cpu.csr(CSR_MIP) & MIP_SEIP, 0);
     }
 
     #[test]

@@ -57,6 +57,20 @@ Omit `--initrd` when the kernel has a built-in initramfs or does not need one.
 The external image may be an uncompressed or kernel-supported compressed CPIO
 archive. rave treats it as opaque data; Linux unpacks it and runs `/init`.
 
+To reproducibly build a minimal RV64IMAC Linux kernel and BusyBox initrd that
+match rave, run:
+
+```sh
+./scripts/build-linux.sh
+```
+
+The script pins and verifies Buildroot, then writes `Image` and
+`rootfs.cpio` to `build/linux/images/`. It uses a static musl/BusyBox userspace,
+an LP64 soft-float ABI, an uncompressed external initrd, and a getty on
+`ttyS0`. The first build downloads and compiles a cross-toolchain and Linux, so
+it can take a while. Use `JOBS=4` to control parallelism. Subsequent runs are
+incremental and retain downloaded sources.
+
 The precompiled `demo/rave.dtb` device tree describes the current single-hart platform, UART,
 CLINT, PLIC, and 128 MiB default memory layout. rave rejects a DTB whose single
 contiguous memory region does not match `--memory`; if that option is changed,

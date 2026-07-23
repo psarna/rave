@@ -1,0 +1,56 @@
+# Rave currently exposes one hart, so avoid SBI hart-start calls entirely.
+# CONFIG_SMP is not set
+# CONFIG_MODULES is not set
+
+# Rave boots from a device tree and initramfs and exposes no discoverable buses
+# or storage. Keep QEMU's broad RISC-V defconfig from turning unused drivers
+# into built-ins when modules are disabled.
+# CONFIG_ACPI is not set
+# CONFIG_PCI is not set
+# CONFIG_VIRTUALIZATION is not set
+# CONFIG_WIRELESS is not set
+# CONFIG_NETDEVICES is not set
+# CONFIG_MTD is not set
+# CONFIG_SCSI is not set
+# CONFIG_ATA is not set
+# CONFIG_I2C is not set
+# CONFIG_SPI is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_DRM is not set
+# CONFIG_SOUND is not set
+# CONFIG_HID_SUPPORT is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_MMC is not set
+
+# There is no persistent filesystem to mount in the initial UART-shell guest.
+# CONFIG_EXT4_FS is not set
+# CONFIG_BTRFS_FS is not set
+# CONFIG_NFS_FS is not set
+
+# Omit general-purpose instrumentation and policy frameworks from this guest.
+# CONFIG_BPF is not set
+# CONFIG_BPF_SYSCALL is not set
+# CONFIG_NET is not set
+# CONFIG_CRYPTO is not set
+# CONFIG_CGROUPS is not set
+# CONFIG_PERF_EVENTS is not set
+# CONFIG_SECURITY is not set
+# CONFIG_FTRACE is not set
+
+# The root filesystem is supplied as an external, uncompressed CPIO archive.
+CONFIG_BLK_DEV_INITRD=y
+
+# Rave's UART is an ns16550 device discovered through the device tree.
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_OF_PLATFORM=y
+
+# Buildroot's /init wrapper mounts devtmpfs before starting BusyBox init.
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# BusyBox init and the standard Buildroot startup scripts use these filesystems.
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+

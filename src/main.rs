@@ -1,5 +1,6 @@
 mod tui;
 
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rave::Machine;
 use std::{
     env, fs,
@@ -16,6 +17,28 @@ const USAGE: &str = "usage:
 
 sizes accept K, M, and G suffixes (default boot memory: 128M)
 boot runs until the guest halts by default; --limit is headless-only";
+
+const HEADLESS_EXIT_BYTE: u8 = 0x1d; // Ctrl-]
+
+enum TerminalInput {
+    Byte(u8),
+    Exit,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -192,7 +215,13 @@ fn run_headless(
     mut machine: Machine,
     instruction_limit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let terminal_input = if io::stdin().is_terminal() {
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let _raw_mode = if stdin_is_terminal {
+        Some(RawModeGuard::enter()?)
+    } else {
+        None
+    };
+    let terminal_input = if stdin_is_terminal {
         Some(spawn_terminal_input())
     } else {
         let mut input = Vec::new();
@@ -205,10 +234,11 @@ fn run_headless(
     let mut stdout = io::stdout().lock();
     for _ in 0..instruction_limit {
         if let Some(input) = &terminal_input {
-            if let Ok(first) = input.try_recv() {
-                let mut bytes = vec![first];
-                bytes.extend(input.try_iter());
-                machine.bus.push_uart_input(&bytes);
+            while let Ok(event) = input.try_recv() {
+                match event {
+                    TerminalInput::Byte(byte) => machine.bus.push_uart_input(&[byte]),
+                    TerminalInput::Exit => return Ok(()),
+                }
             }
         }
         let reason = machine.step()?;
@@ -226,13 +256,17 @@ fn run_headless(
     Err(format!("guest exceeded {instruction_limit} instructions").into())
 }
 
-fn spawn_terminal_input() -> Receiver<u8> {
+fn spawn_terminal_input() -> Receiver<TerminalInput> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let stdin = io::stdin();
         for byte in stdin.lock().bytes() {
             match byte {
-                Ok(byte) if sender.send(byte).is_ok() => {}
+                Ok(HEADLESS_EXIT_BYTE) => {
+                    let _ = sender.send(TerminalInput::Exit);
+                    break;
+                }
+                Ok(byte) if sender.send(TerminalInput::Byte(byte)).is_ok() => {}
                 _ => break,
             }
         }

@@ -94,6 +94,7 @@ struct Uart {
     output: Vec<u8>,
     input: VecDeque<u8>,
     interrupt_enable: u8,
+    transmit_interrupt_pending: bool,
     line_control: u8,
     divisor_latch: u16,
     waiting_for_input: bool,
@@ -188,7 +189,7 @@ impl Bus {
     }
 
     pub fn set_uart_interrupt_enable(&mut self, value: u64) {
-        self.uart.interrupt_enable = (value as u8) & Uart::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE;
+        self.uart.set_interrupt_enable(value as u8);
     }
 
     pub fn plic_uart_priority(&self) -> u64 {
@@ -686,7 +687,7 @@ impl Plic {
     fn pending_source(&self, uart: &Uart) -> Option<u32> {
         if !self.uart_claimed
             && self.priorities[Self::UART_SOURCE as usize] > 0
-            && uart.receive_interrupt_pending()
+            && uart.interrupt_pending()
         {
             Some(Self::UART_SOURCE)
         } else {
@@ -719,7 +720,9 @@ impl Uart {
     const LINE_STATUS: u64 = 5;
     const LINE_CONTROL_DIVISOR_LATCH_ACCESS: u8 = 1 << 7;
     const INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE: u8 = 1;
+    const INTERRUPT_ENABLE_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 1;
     const INTERRUPT_IDENTIFICATION_NO_INTERRUPT: u8 = 1;
+    const INTERRUPT_IDENTIFICATION_TRANSMIT_HOLDING_EMPTY: u8 = 0x02;
     const INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE: u8 = 0x04;
     const LINE_STATUS_DATA_READY: u8 = 1;
     const LINE_STATUS_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 5;
@@ -739,7 +742,7 @@ impl Uart {
                 (self.divisor_latch >> 8) as u8
             }
             Self::INTERRUPT_ENABLE => self.interrupt_enable,
-            Self::INTERRUPT_IDENTIFICATION => self.interrupt_identification(),
+            Self::INTERRUPT_IDENTIFICATION => self.read_interrupt_identification(),
             Self::LINE_CONTROL => self.line_control,
             Self::LINE_STATUS => {
                 let has_input = !self.input.is_empty();
@@ -772,12 +775,31 @@ impl Uart {
             && !self.input.is_empty()
     }
 
+    fn transmit_interrupt_pending(&self) -> bool {
+        self.interrupt_enable & Self::INTERRUPT_ENABLE_TRANSMIT_HOLDING_EMPTY != 0
+            && self.transmit_interrupt_pending
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        self.receive_interrupt_pending() || self.transmit_interrupt_pending()
+    }
+
     fn interrupt_identification(&self) -> u8 {
         if self.receive_interrupt_pending() {
             Self::INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE
+        } else if self.transmit_interrupt_pending() {
+            Self::INTERRUPT_IDENTIFICATION_TRANSMIT_HOLDING_EMPTY
         } else {
             Self::INTERRUPT_IDENTIFICATION_NO_INTERRUPT
         }
+    }
+
+    fn read_interrupt_identification(&mut self) -> u8 {
+        let identification = self.interrupt_identification();
+        if identification == Self::INTERRUPT_IDENTIFICATION_TRANSMIT_HOLDING_EMPTY {
+            self.transmit_interrupt_pending = false;
+        }
+        identification
     }
 
     fn line_status(has_input: bool) -> u8 {
@@ -794,13 +816,17 @@ impl Uart {
             Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING if self.divisor_latch_access() => {
                 self.divisor_latch = (self.divisor_latch & 0xff00) | u16::from(value);
             }
-            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => self.output.push(value),
+            Self::RECEIVER_BUFFER_OR_TRANSMIT_HOLDING => {
+                self.output.push(value);
+                // Transmission is instantaneous in this model. Writing the
+                // holding register therefore causes it to become empty again,
+                // which raises the edge-latched THRE interrupt.
+                self.transmit_interrupt_pending = true;
+            }
             Self::INTERRUPT_ENABLE if self.divisor_latch_access() => {
                 self.divisor_latch = (self.divisor_latch & 0x00ff) | (u16::from(value) << 8);
             }
-            Self::INTERRUPT_ENABLE => {
-                self.interrupt_enable = value & Self::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE;
-            }
+            Self::INTERRUPT_ENABLE => self.set_interrupt_enable(value),
             Self::LINE_CONTROL => self.line_control = value,
             _ => {}
         }
@@ -808,6 +834,19 @@ impl Uart {
 
     fn divisor_latch_access(&self) -> bool {
         self.line_control & Self::LINE_CONTROL_DIVISOR_LATCH_ACCESS != 0
+    }
+
+    fn set_interrupt_enable(&mut self, value: u8) {
+        let was_transmit_enabled =
+            self.interrupt_enable & Self::INTERRUPT_ENABLE_TRANSMIT_HOLDING_EMPTY != 0;
+        self.interrupt_enable = value
+            & (Self::INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE
+                | Self::INTERRUPT_ENABLE_TRANSMIT_HOLDING_EMPTY);
+        if !was_transmit_enabled
+            && self.interrupt_enable & Self::INTERRUPT_ENABLE_TRANSMIT_HOLDING_EMPTY != 0
+        {
+            self.transmit_interrupt_pending = true;
+        }
     }
 }
 
@@ -992,6 +1031,38 @@ mod tests {
         assert_eq!(bus.read_u8(UART_START + 2), Ok(4));
         assert_eq!(bus.read_u8(UART_START), Ok(b'C'));
         assert_eq!(bus.read_u8(UART_START + 2), Ok(1));
+    }
+
+    #[test]
+    fn uart_transmit_empty_interrupt_reasserts_after_each_write() {
+        let mut bus = Bus::new(16);
+
+        bus.write_u8(UART_START + 1, 2).unwrap();
+        assert_eq!(bus.read_u8(UART_START + 1), Ok(2));
+        assert_eq!(bus.peek_u8(UART_START + 2), Ok(2));
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(2));
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(1));
+
+        bus.write_u8(UART_START, b'X').unwrap();
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(2));
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(1));
+    }
+
+    #[test]
+    fn plic_routes_uart_transmit_empty_interrupt() {
+        let mut bus = Bus::new(16);
+        bus.write_u32(PLIC_START + 10 * 4, 1).unwrap();
+        bus.write_u32(PLIC_START + 0x2080, 1 << 10).unwrap();
+        bus.write_u8(UART_START + 1, 2).unwrap();
+
+        assert!(bus.supervisor_external_interrupt_pending());
+        assert_eq!(bus.read_u32(PLIC_START + 0x20_1004).unwrap(), 10);
+        assert_eq!(bus.read_u8(UART_START + 2), Ok(2));
+        bus.write_u32(PLIC_START + 0x20_1004, 10).unwrap();
+        assert!(!bus.supervisor_external_interrupt_pending());
+
+        bus.write_u8(UART_START, b'X').unwrap();
+        assert!(bus.supervisor_external_interrupt_pending());
     }
 
     #[test]
