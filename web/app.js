@@ -42,6 +42,7 @@ const uartHistory = [];
 let uartHistoryIndex = 0;
 let uartHistoryDraft = "";
 let uartStagedLine = "";
+let uartLineOnGuest = false;
 
 if (location.protocol === "file:") {
   setStatus("serve this folder over HTTP to boot", true);
@@ -64,12 +65,14 @@ $("#uart-form").addEventListener("submit", (event) => {
   uartHistoryIndex = uartHistory.length;
   uartHistoryDraft = "";
   uartStagedLine = "";
+  uartLineOnGuest = false;
   setStatus("running");
   sendUart(`${uartInput.value}\n`);
   uartInput.value = "";
 });
 uartInput.addEventListener("keydown", (event) => {
   if (event.key === "Tab") completeUartInput(event);
+  else if (event.key === "Backspace") backspaceUartInput(event);
   else if (event.key === "ArrowUp") recallUartHistory(-1, event);
   else if (event.key === "ArrowDown") recallUartHistory(1, event);
 });
@@ -85,6 +88,7 @@ async function start() {
   ansiTerminal.clear();
   uartInput.value = "";
   uartStagedLine = "";
+  uartLineOnGuest = false;
   uartHistoryIndex = uartHistory.length;
   uartHistoryDraft = "";
   registerList.textContent = "";
@@ -175,10 +179,18 @@ function completeUartInput(event) {
   event.preventDefault();
   if (!worker) return;
   uartStagedLine += uartInput.value;
+  uartLineOnGuest = true;
   sendUart(`${uartInput.value}\t`);
   uartInput.value = "";
   uartHistoryIndex = uartHistory.length;
   uartHistoryDraft = "";
+}
+
+function backspaceUartInput(event) {
+  if (!worker || !uartLineOnGuest || uartInput.value !== "") return;
+  event.preventDefault();
+  sendUart("\x7f");
+  uartStagedLine = uartStagedLine.slice(0, -1);
 }
 
 function recallUartHistory(direction, event) {
@@ -249,12 +261,14 @@ class AnsiTerminal {
   constructor(element) {
     this.element = element;
     this.pending = "";
+    this.pendingCarriageReturn = false;
     this.resetStyle();
   }
 
   clear() {
     this.element.replaceChildren();
     this.pending = "";
+    this.pendingCarriageReturn = false;
     this.resetStyle();
   }
 
@@ -277,6 +291,7 @@ class AnsiTerminal {
       }
 
       if (this.pending[escape + 1] !== "[") {
+        this.flushCarriageReturn();
         // Consume unsupported two-byte escape commands instead of printing them.
         offset = escape + 2;
         continue;
@@ -295,6 +310,7 @@ class AnsiTerminal {
 
       const parameters = this.pending.slice(escape + 2, end);
       const command = this.pending[end];
+      this.flushCarriageReturn();
       if (command === "m") this.applySgr(parameters);
       if (command === "J" && (parameters === "2" || parameters === "3")) {
         this.element.replaceChildren();
@@ -359,6 +375,61 @@ class AnsiTerminal {
   }
 
   append(text) {
+    if (!text) return;
+    let start = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index];
+      if (this.pendingCarriageReturn) {
+        this.pendingCarriageReturn = false;
+        if (character === "\n") {
+          this.appendStyled(text.slice(start, index) + "\n");
+          start = index + 1;
+          continue;
+        }
+        this.carriageReturn();
+      }
+      if (character === "\r" || character === "\x07" || character === "\x08") {
+        this.appendStyled(text.slice(start, index));
+        start = index + 1;
+        if (character === "\r") this.pendingCarriageReturn = true;
+        else if (character === "\x08") this.backspace();
+      }
+    }
+    this.appendStyled(text.slice(start));
+  }
+
+  flushCarriageReturn() {
+    if (!this.pendingCarriageReturn) return;
+    this.pendingCarriageReturn = false;
+    this.carriageReturn();
+  }
+
+  carriageReturn() {
+    while (this.element.lastChild) {
+      const node = this.element.lastChild;
+      const text = node.textContent;
+      const newline = text.lastIndexOf("\n");
+      if (newline === -1) {
+        node.remove();
+        continue;
+      }
+      const retained = text.slice(0, newline + 1);
+      if (node.nodeType === Node.TEXT_NODE) node.data = retained;
+      else node.firstChild.data = retained;
+      return;
+    }
+  }
+
+  backspace() {
+    const node = this.element.lastChild;
+    if (!node || node.textContent.endsWith("\n")) return;
+    const shortened = Array.from(node.textContent).slice(0, -1).join("");
+    if (!shortened) node.remove();
+    else if (node.nodeType === Node.TEXT_NODE) node.data = shortened;
+    else node.firstChild.data = shortened;
+  }
+
+  appendStyled(text) {
     if (!text) return;
     const foreground = resolveColor(this.style.foreground, this.style.bold);
     const background = resolveColor(this.style.background, false);
