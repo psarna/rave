@@ -33,8 +33,9 @@ const terminal = $("#terminal");
 const uartInput = $("#uart-input");
 const registerList = $("#register-list");
 const status = $("#status");
-const decoder = new TextDecoder();
+let decoder = new TextDecoder();
 const encoder = new TextEncoder();
+let ansiTerminal;
 let worker = null;
 
 if (location.protocol === "file:") {
@@ -49,7 +50,7 @@ updateMode();
 
 $("#run").addEventListener("click", start);
 $("#stop").addEventListener("click", () => stop("stopped"));
-$("#clear").addEventListener("click", () => { terminal.textContent = ""; });
+$("#clear").addEventListener("click", () => ansiTerminal.clear());
 $("#uart-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (!worker) return;
@@ -65,7 +66,8 @@ async function start() {
     return;
   }
   stop();
-  terminal.textContent = "";
+  decoder = new TextDecoder();
+  ansiTerminal.clear();
   registerList.textContent = "";
   setStatus("loading images…");
   try {
@@ -107,7 +109,7 @@ async function start() {
 
 function receive({ data }) {
   if (data.type === "uart") {
-    terminal.textContent += decoder.decode(data.bytes, { stream: true });
+    ansiTerminal.write(decoder.decode(data.bytes, { stream: true }));
     terminal.scrollTop = terminal.scrollHeight;
   } else if (data.type === "status") {
     setStatus(data.value);
@@ -189,3 +191,190 @@ function setStatus(value, error = false) {
   status.textContent = value;
   status.classList.toggle("error", error);
 }
+
+const ANSI_COLORS = [
+  "#263640", "#ef6b73", "#65d18c", "#e8c66a",
+  "#62a8ea", "#c792ea", "#56d6d0", "#d6e2e4",
+  "#607985", "#ff7b85", "#7ee8a5", "#f3d984",
+  "#82bfff", "#d9a4ff", "#76eee8", "#ffffff",
+];
+
+class AnsiTerminal {
+  constructor(element) {
+    this.element = element;
+    this.pending = "";
+    this.resetStyle();
+  }
+
+  clear() {
+    this.element.replaceChildren();
+    this.pending = "";
+    this.resetStyle();
+  }
+
+  write(text) {
+    this.pending += text;
+    let offset = 0;
+
+    while (offset < this.pending.length) {
+      const escape = this.pending.indexOf("\x1b", offset);
+      if (escape === -1) {
+        this.append(this.pending.slice(offset));
+        this.pending = "";
+        return;
+      }
+
+      this.append(this.pending.slice(offset, escape));
+      if (escape + 1 >= this.pending.length) {
+        this.pending = this.pending.slice(escape);
+        return;
+      }
+
+      if (this.pending[escape + 1] !== "[") {
+        // Consume unsupported two-byte escape commands instead of printing them.
+        offset = escape + 2;
+        continue;
+      }
+
+      let end = escape + 2;
+      while (end < this.pending.length) {
+        const code = this.pending.charCodeAt(end);
+        if (code >= 0x40 && code <= 0x7e) break;
+        end += 1;
+      }
+      if (end === this.pending.length) {
+        this.pending = this.pending.slice(escape);
+        return;
+      }
+
+      const parameters = this.pending.slice(escape + 2, end);
+      const command = this.pending[end];
+      if (command === "m") this.applySgr(parameters);
+      if (command === "J" && (parameters === "2" || parameters === "3")) {
+        this.element.replaceChildren();
+      }
+      offset = end + 1;
+    }
+
+    this.pending = "";
+  }
+
+  resetStyle() {
+    this.style = {
+      bold: false,
+      dim: false,
+      underline: false,
+      reverse: false,
+      foreground: null,
+      background: null,
+    };
+  }
+
+  applySgr(parameters) {
+    const values = parameters === ""
+      ? [0]
+      : parameters.split(";").map((value) => value === "" ? 0 : Number(value));
+
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index];
+      if (value === 0) this.resetStyle();
+      else if (value === 1) this.style.bold = true;
+      else if (value === 2) this.style.dim = true;
+      else if (value === 4) this.style.underline = true;
+      else if (value === 7) this.style.reverse = true;
+      else if (value === 22) {
+        this.style.bold = false;
+        this.style.dim = false;
+      } else if (value === 24) this.style.underline = false;
+      else if (value === 27) this.style.reverse = false;
+      else if (value >= 30 && value <= 37) this.style.foreground = value - 30;
+      else if (value === 39) this.style.foreground = null;
+      else if (value >= 40 && value <= 47) this.style.background = value - 40;
+      else if (value === 49) this.style.background = null;
+      else if (value >= 90 && value <= 97) this.style.foreground = value - 90 + 8;
+      else if (value >= 100 && value <= 107) this.style.background = value - 100 + 8;
+      else if ((value === 38 || value === 48) && values[index + 1] === 5) {
+        const color = ansi256(values[index + 2]);
+        if (color !== null) this.setColor(value, color);
+        index += 2;
+      } else if ((value === 38 || value === 48) && values[index + 1] === 2) {
+        const rgb = values.slice(index + 2, index + 5);
+        if (rgb.length === 3 && rgb.every((part) => part >= 0 && part <= 255)) {
+          this.setColor(value, `rgb(${rgb.join(", ")})`);
+        }
+        index += 4;
+      }
+    }
+  }
+
+  setColor(command, color) {
+    if (command === 38) this.style.foreground = color;
+    else this.style.background = color;
+  }
+
+  append(text) {
+    if (!text) return;
+    const foreground = resolveColor(this.style.foreground, this.style.bold);
+    const background = resolveColor(this.style.background, false);
+    const isDefault = !this.style.bold && !this.style.dim &&
+      !this.style.underline && !this.style.reverse &&
+      foreground === null && background === null;
+
+    if (isDefault) {
+      const last = this.element.lastChild;
+      if (last?.nodeType === Node.TEXT_NODE) last.appendData(text);
+      else this.element.append(document.createTextNode(text));
+      return;
+    }
+
+    let color = foreground;
+    let backgroundColor = background;
+    if (this.style.reverse) {
+      color = backgroundColor ?? "#03090d";
+      backgroundColor = foreground ?? "#8bf1e9";
+    }
+    const signature = JSON.stringify([
+      color, backgroundColor, this.style.bold, this.style.dim, this.style.underline,
+    ]);
+    const last = this.element.lastElementChild;
+    if (last?.dataset.ansiStyle === signature && last === this.element.lastChild) {
+      last.firstChild.appendData(text);
+      return;
+    }
+
+    const span = document.createElement("span");
+    span.dataset.ansiStyle = signature;
+    if (color !== null) span.style.color = color;
+    if (backgroundColor !== null) span.style.backgroundColor = backgroundColor;
+    if (this.style.bold) span.style.fontWeight = "700";
+    if (this.style.dim) span.style.opacity = "0.65";
+    if (this.style.underline) span.style.textDecoration = "underline";
+    span.append(document.createTextNode(text));
+    this.element.append(span);
+  }
+}
+
+function resolveColor(color, bold) {
+  if (typeof color === "number") {
+    const index = bold && color < 8 ? color + 8 : color;
+    return ANSI_COLORS[index];
+  }
+  return color;
+}
+
+function ansi256(value) {
+  if (!Number.isInteger(value) || value < 0 || value > 255) return null;
+  if (value < 16) return ANSI_COLORS[value];
+  if (value < 232) {
+    const level = [0, 95, 135, 175, 215, 255];
+    const offset = value - 16;
+    const red = level[Math.floor(offset / 36)];
+    const green = level[Math.floor((offset % 36) / 6)];
+    const blue = level[offset % 6];
+    return `rgb(${red}, ${green}, ${blue})`;
+  }
+  const gray = 8 + (value - 232) * 10;
+  return `rgb(${gray}, ${gray}, ${gray})`;
+}
+
+ansiTerminal = new AnsiTerminal(terminal);

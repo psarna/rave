@@ -4,6 +4,29 @@
 
 A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 
+## Browser demo
+
+[![Boot Linux with rave in your browser](demo/careful.png)](https://rave.sarna.dev)
+
+The emulator core also builds to WebAssembly. The static site in `web/` runs
+the machine in a Web Worker, boots the bundled Linux and Buildroot initramfs by
+default, offers alternate or uploaded images, and connects terminal input and
+output to the emulated UART. The bundled Linux assets are reproducible with
+`./scripts/build-linux.sh`.
+
+Install the JavaScript dependencies, then build and serve the repository root:
+
+```sh
+npm install
+./build-web.sh
+python3 -m http.server 8000
+```
+
+... or just enjoy https://rave.sarna.dev
+
+Virtio is not implemented yet, so the bundled Linux system uses an initramfs
+and intentionally has no networking or persistent block storage.
+
 - 32 integer registers and an explicit program counter
 - base RV64I integer, branch, jump, and load/store instructions
 - RV64M integer multiply, divide, and remainder instructions
@@ -200,24 +223,3 @@ Auto tests:
 ```sh
 cargo test
 ```
-
-## Browser demo
-
-The emulator core also builds to WebAssembly. The static site in `web/` runs
-the machine in a Web Worker, boots the bundled Linux and Buildroot initramfs by
-default, offers alternate or uploaded images, and connects terminal input and
-output to the emulated UART. The bundled Linux assets are reproducible with
-`./scripts/build-linux.sh`.
-
-Install the JavaScript dependencies, then build and serve the repository root:
-
-```sh
-npm install
-./build-web.sh
-python3 -m http.server 8000
-```
-
-... or just enjoy https://rave.sarna.dev
-
-Virtio is not implemented yet, so the bundled Linux system uses an initramfs
-and intentionally has no networking or persistent block storage.
