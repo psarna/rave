@@ -8,13 +8,12 @@ A minimal RV64IMAC_Zicsr_Zifencei (more letters coming!) emulator
 
 [![Boot Linux with rave in your browser](demo/careful.png)](https://rave.sarna.dev)
 
-The emulator core also builds to WebAssembly. The static site in `web/` runs
-the machine in a Web Worker, boots the bundled Linux and Buildroot initramfs by
-default, offers alternate or uploaded images, and connects terminal input and
-output to the emulated UART. The bundled Linux assets are reproducible with
+The emulator core is a comfy userspace program with hardly any syscalls. As such, it compiles just fine to Wasm!
+The static site in `web/` runs the machine in a web worker, and is capable of booting a simple
+Linux with busybox right in your browser. Artifacts can be reproduced with
 `./scripts/build-linux.sh`.
 
-Install the JavaScript dependencies, then build and serve the repository root:
+Install the js deps, then build and serve the repository root:
 
 ```sh
 npm install
@@ -23,6 +22,8 @@ python3 -m http.server 8000
 ```
 
 ... or just enjoy https://rave.sarna.dev
+
+### Current state
 
 Virtio is not implemented yet, so the bundled Linux system uses an initramfs
 and intentionally has no networking or persistent block storage.

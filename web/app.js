@@ -83,6 +83,10 @@ async function start() {
   stop();
   decoder = new TextDecoder();
   ansiTerminal.clear();
+  uartInput.value = "";
+  uartStagedLine = "";
+  uartHistoryIndex = uartHistory.length;
+  uartHistoryDraft = "";
   registerList.textContent = "";
   setStatus("loading images…");
   try {
